@@ -111,6 +111,43 @@ function M.setup_autocmds(windows)
       end,
     })
   end
+
+  M.setup_window_only_keymap(windows)
+end
+
+---Set <C-w>o / <C-w><C-o> on both opencode buffers to close all other
+---non-floating windows while keeping the opencode pair intact.
+---@param windows OpencodeWindowState
+function M.setup_window_only_keymap(windows)
+  local opencode_wins = function()
+    local t = {}
+    for _, w in ipairs({ windows.input_win, windows.output_win, windows.footer_win }) do
+      if w then
+        t[w] = true
+      end
+    end
+    return t
+  end
+
+  local handler = function()
+    local keep = opencode_wins()
+    keep[vim.api.nvim_get_current_win()] = true
+    for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+      if not keep[win] and vim.api.nvim_win_is_valid(win) then
+        local cfg = vim.api.nvim_win_get_config(win)
+        if cfg.relative == '' then
+          pcall(vim.api.nvim_win_close, win, false)
+        end
+      end
+    end
+  end
+
+  for _, buf in ipairs({ windows.input_buf, windows.output_buf }) do
+    if buf and vim.api.nvim_buf_is_valid(buf) then
+      vim.keymap.set('n', '<C-w>o', handler, { buffer = buf, desc = 'Keep only opencode windows', nowait = true })
+      vim.keymap.set('n', '<C-w><C-o>', handler, { buffer = buf, desc = 'Keep only opencode windows', nowait = true })
+    end
+  end
 end
 
 ---@param windows OpencodeWindowState?
