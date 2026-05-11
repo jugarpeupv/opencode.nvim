@@ -163,10 +163,7 @@ M.defaults = {
       tools = {
         show_output = true,
         show_reasoning_output = true,
-        use_folds = true,
-        folding_threshold = 20,
       },
-
       max_messages = nil,
       always_scroll_to_bottom = false,
     },

@@ -46,8 +46,7 @@ function M.format(output, part, get_child_parts)
 
   utils.format_action(output, icons.get('task'), 'task', description, utils.get_duration_text(part))
 
-  local output_start_line = output:get_line_count() + 1
-  if config.ui.output.tools.show_output or config.ui.output.tools.use_folds then
+  if config.ui.output.tools.show_output then
     local child_session_id = metadata.sessionId
     local child_parts = child_session_id and get_child_parts and get_child_parts(child_session_id)
 
@@ -72,8 +71,6 @@ function M.format(output, part, get_child_parts)
         output:add_empty_line()
       end
     end
-
-    output:add_fold_with_threshold(output_start_line, config.ui.output.tools.show_output, config.ui.output.tools.use_folds)
   end
 
   local end_line = output:get_line_count()
