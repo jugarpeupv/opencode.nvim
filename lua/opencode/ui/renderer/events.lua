@@ -224,11 +224,10 @@ function M.on_message_updated(message, revert_index)
     replay_orphan_parts(msg.info.id)
     flush.mark_message_dirty(msg.info.id)
     state.renderer.set_current_message(msg)
-  end
-
-  if msg.info.role == 'user' then
-    state.renderer.set_last_user_message(msg)
-    scroll(true)
+    if message.info.role == 'user' then
+      state.renderer.set_last_user_message(msg)
+      scroll(true)
+    end
   end
 
   update_stats(msg)
