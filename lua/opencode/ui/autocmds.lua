@@ -8,7 +8,7 @@ function M.setup_autocmds(windows)
   output_window.setup_autocmds(windows, group)
 
   -- Only keep shared autocmds here (e.g., WinClosed, WinLeave for all windows)
-  local wins = { windows.input_win, windows.output_win, windows.footer_win }
+  local wins = { windows.input_win, windows.output_win, windows.footer_win, windows.tab_strip_win }
   vim.api.nvim_create_autocmd('WinClosed', {
     group = group,
     pattern = table.concat(wins, ','),
@@ -103,15 +103,16 @@ function M.setup_autocmds(windows)
       local current_win = vim.api.nvim_get_current_win()
       local current_buf = vim.api.nvim_get_current_buf()
 
-      if current_win ~= windows.output_win and current_win ~= windows.input_win then
-        return
-      end
+        if current_win ~= windows.output_win and current_win ~= windows.input_win and current_win ~= windows.tab_strip_win then
+          return
+        end
 
-      local is_opencode_buf = (
-        current_buf == windows.output_buf
-        or current_buf == windows.input_buf
-        or (windows.footer_buf and current_buf == windows.footer_buf)
-      )
+        local is_opencode_buf = (
+          current_buf == windows.output_buf
+          or current_buf == windows.input_buf
+          or (windows.footer_buf and current_buf == windows.footer_buf)
+          or (windows.tab_strip_buf and current_buf == windows.tab_strip_buf)
+        )
 
       if not is_opencode_buf then
         vim.schedule(function()
@@ -132,6 +133,7 @@ function M.setup_resize_handler(windows)
       require('opencode.ui.footer').update_window(windows)
       input_window.update_dimensions(windows)
       output_window.update_dimensions(windows)
+      require('opencode.ui.session_tab_strip').update_window(windows)
     end,
   })
   vim.api.nvim_create_autocmd('WinResized', {
@@ -149,6 +151,7 @@ function M.setup_resize_handler(windows)
 
       require('opencode.ui.topbar').render()
       require('opencode.ui.footer').update_window(windows)
+      require('opencode.ui.session_tab_strip').update_window(windows)
     end,
   })
 end
