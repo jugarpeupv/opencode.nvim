@@ -50,6 +50,7 @@ local M = {
   _interaction = nil,
   _observations = {},
 } --[[@as PermissionWindow]]
+local notified_permissions = {}
 
 -- Once-per-id notification guard: a request that leaves pending and is later
 -- observed as pending again fires the hook again, matching questions.
@@ -494,10 +495,16 @@ function M.sync(observations)
         pending[#pending + 1] = request
         owners[request.id] = observation
         current_permissions[request.id] = true
-        -- The store's pending_permissions slice is never populated in
-        -- production, so fire the hook here rather than via its subscription.
+        -- Same once-per-id contract as questions: re-fires if the id returns to pending.
         if not notified_permissions[request.id] and config.hooks and config.hooks.on_permission_requested then
           pcall(config.hooks.on_permission_requested, observed.session)
+        end
+        local session_id = request.session_id or request.sessionID
+        if session_id then
+          local runtime = session_tabs.find_by_session_id(session_id)
+          if runtime then
+            session_tabs.add_pending_permission(runtime.id, request)
+          end
         end
       end
     end
