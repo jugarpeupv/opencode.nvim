@@ -19,11 +19,17 @@ local function session_title(runtime)
 end
 
 local function track(kind, request)
-  if not request or not request.id or not request.sessionID then
+  if not request or not request.id then
     return
   end
 
-  local runtime = session_tabs.find_by_session_id(request.sessionID)
+  -- Adapters normalize wire `sessionID` to `session_id`; accept both.
+  local session_id = request.session_id or request.sessionID
+  if not session_id then
+    return
+  end
+
+  local runtime = session_tabs.find_by_session_id(session_id)
   if not runtime then
     return
   end
