@@ -16,8 +16,13 @@ local function session_title(runtime)
 end
 
 local function track(kind, request)
-  local session_id = request and (request.sessionID or request.session_id)
-  if not request or not request.id or not session_id then
+  if not request or not request.id then
+    return
+  end
+
+  -- Adapters normalize wire `sessionID` to `session_id`; accept both.
+  local session_id = request.session_id or request.sessionID
+  if not session_id then
     return
   end
 
