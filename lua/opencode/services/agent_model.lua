@@ -231,7 +231,10 @@ M.initialize_current_model = Promise.async(function(opts)
   if not is_current() then
     return
   end
-  if cfg and cfg.model and cfg.model ~= '' then
+  local mode_config = cfg and cfg.agent and cfg.agent[state.current_mode]
+  if mode_config and mode_config.model and mode_config.model ~= '' then
+    state.model.set_model(mode_config.model)
+  elseif cfg and cfg.model and cfg.model ~= '' then
     state.model.set_model(cfg.model)
   else
     local catalog = config_file.get_opencode_providers():await()
@@ -248,5 +251,60 @@ M.initialize_current_model = Promise.async(function(opts)
 
   return state.current_model
 end)
+
+---Resolve current choices and missing defaults for a new interactive session.
+---Rejects when no primary agent is available or a lookup propagates an error.
+---@type fun(): Promise<OpencodeSessionSelection>
+M.resolve_session_selection = Promise.async(function()
+  if not M.ensure_current_mode():await() then
+    error('Cannot resolve session agent')
+  end
+  M.initialize_current_model():await()
+  return { mode = state.current_mode, model = state.current_model, variant = state.current_variant }
+end)
+
+---Apply a server-side model selection ({id or modelID, providerID, variant?})
+---to local state; same-value calls are no-ops.
+---@param model? table
+function M.apply_server_selection(model)
+  local model_id = model and (model.id or model.modelID)
+  if not (model and model_id and model.providerID) then
+    return
+  end
+  local model_str = model.providerID .. '/' .. model_id
+  if state.current_model ~= model_str then
+    state.model.set_model(model_str)
+  end
+  if model.variant ~= nil and state.current_variant ~= model.variant then
+    state.model.set_variant(model.variant)
+  end
+end
+
+---@param agent? string
+function M.apply_server_agent(agent)
+  if type(agent) ~= 'string' or agent == '' or state.current_mode == agent then
+    return
+  end
+  state.model.set_mode(agent)
+end
+
+---Pull the authoritative session model from the server so state converges on
+---panel open; live changes arrive via session.model.selected events.
+---@return Promise|nil nil when there is no ready connection or active session
+function M.sync_from_server()
+  local connection = state.opencode_server
+  local session = state.active_session
+  if not (connection and session and session.id and connection:is_ready()) then
+    return nil
+  end
+  return connection.operations
+    .get_session(connection, session.id, session.location, util.apply_path_map, util.apply_reverse_path_map)
+    :and_then(function(fact)
+      M.apply_server_selection(fact and fact.model)
+    end)
+    :catch(function(err)
+      log.warn('Failed to sync session model from server: %s', tostring(err))
+    end)
+end
 
 return M

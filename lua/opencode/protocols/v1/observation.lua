@@ -13,45 +13,31 @@ local mapped_permission = normalize.mapped_permission
 local mapped_question = normalize.mapped_question
 
 local lifecycle = require('opencode.protocols.observation')
+local log = require('opencode.log')
 local id = require('opencode.id')
 local Promise = require('opencode.promise')
 local util = require('opencode.util')
-local config_file = require('opencode.config_file')
 local event_capture = require('opencode.event_capture')
 
 local M = {}
 
 ---@param opts SendMessageOpts
----@param selected {mode?: string, model?: string, variant?: string, default_mode?: string}
+---@param selected OpencodeMessageSelection
 ---@return table, OpencodeSessionTabModelUpdate
 function M.prepare_message(opts, selected)
   if opts.skills and #opts.skills > 0 then
     error('V1 submit does not support native skill attachments')
   end
-  ---@type {mode?: string, model?: string, variant?: string, default_mode?: string, default_model?: string, available_agents?: string[]}
-  local message_selection = {
-    mode = selected.mode,
-    model = selected.model,
-    variant = selected.variant,
-    default_mode = selected.default_mode,
-  }
-  if opts.model == nil and selected.model == nil then
-    local remote_config = config_file.get_opencode_config():await()
-    message_selection.default_model = remote_config and remote_config.model ~= '' and remote_config.model or nil
-  end
-  if opts.agent or message_selection.mode or message_selection.default_mode then
-    message_selection.available_agents = config_file.get_opencode_agents():await()
-  end
 
   local explicit_model = opts.model ~= nil
   if opts.agent == nil then
-    opts.agent = message_selection.mode or message_selection.default_mode
+    opts.agent = selected.mode or selected.default_mode
   end
   if opts.model == nil then
-    opts.model = message_selection.model or message_selection.default_model
+    opts.model = selected.model or selected.default_model
   end
   if opts.variant == nil then
-    opts.variant = message_selection.variant
+    opts.variant = selected.variant
   end
 
   local overrides = {}
@@ -74,7 +60,7 @@ function M.prepare_message(opts, selected)
   end
   if opts.agent then
     overrides.agent = opts.agent
-    if vim.tbl_contains(message_selection.available_agents or {}, opts.agent) then
+    if vim.tbl_contains(selected.available_agents or {}, opts.agent) then
       update.mode = opts.agent
     end
   end
@@ -134,6 +120,7 @@ local function record_diagnostic(observation, message)
     state = 'error',
     error = { kind = 'protocol_contract', message = message },
   }
+  log.warn('V1 observation diagnostic (messages): %s', message)
 end
 
 local function remove_from_order(order, item_id)
@@ -994,8 +981,9 @@ local function track_submission(observation, result)
 end
 
 ---@param connection table
-function M.close(connection)
-  lifecycle.close(connection)
+---@param reason string
+function M.close(connection, reason)
+  lifecycle.close(connection, reason)
 end
 
 local function clear_unresolved_mentions(observation)
@@ -1036,8 +1024,8 @@ function M.new(connection, ref)
     on_stream_error = function(current, message)
       fail_submissions(current, 'V1 reply completion is unknown: ' .. message)
     end,
-    on_close = function(current)
-      fail_submissions(current, 'connection closed')
+    on_close = function(current, reason)
+      fail_submissions(current, 'connection closed (' .. tostring(reason) .. ')')
       clear_unresolved_mentions(current)
     end,
   })
@@ -1049,13 +1037,15 @@ function M.new(connection, ref)
   observation._v1_history_complete = false
   observation._v1_history_limit = 50
   observation._v1_older_loading = false
+  observation.needs_message_defaults = true
   function observation.prepare_message(_, opts, selected)
     return M.prepare_message(opts, selected)
   end
   ---@param input table
   ---@param opts? {async?: boolean}
+  ---@param on_input_id? fun(id: string)
   ---@return Promise<OpencodeSubmission>
-  function observation:submit(input, opts)
+  function observation:submit(input, opts, on_input_id)
     opts = opts or {}
     if input and input.model ~= nil then
       if
@@ -1072,6 +1062,9 @@ function M.new(connection, ref)
       end
     end
     local message_id = id.ascending('message')
+    if on_input_id then
+      on_input_id(message_id)
+    end
     local body = {
       messageID = message_id,
       model = vim.deepcopy(input and input.model),

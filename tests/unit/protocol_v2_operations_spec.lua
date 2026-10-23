@@ -212,14 +212,95 @@ describe('V2 protocol operations', function()
       end)
       :wait()
     assert.equals('/api/session/ses_123/diff', request.path)
-    assert.equals('from=msg_one&to=msg_two', request.query)
+    assert.equals('context=1073741823&from=msg_one&to=msg_two', request.query)
     assert.equals('/host/file.lua', files[1].file)
     assert.equals('@@ -1 +1 @@\n-old\n+new', files[1].patch)
   end)
 
+  it('requests the largest context Git can safely double even without explicit turn boundaries', function()
+    local request
+    transport.request = function(_, value)
+      request = value
+      return Promise.new():resolve({ status = 200, body = '{"data":[]}' })
+    end
+    assert.same({}, operations.diff_session(ready_connection(), 'ses_123'):wait())
+    assert.equals('GET', request.method)
+    assert.equals('/api/session/ses_123/diff', request.path)
+    assert.equals('context=1073741823', request.query)
+    local context = assert(tonumber(request.query:match('^context=(%d+)$')))
+    local int_max = 2 ^ 31 - 1
+    assert.is_true(context * 2 <= int_max)
+    assert.is_true((context + 1) * 2 > int_max)
+  end)
+
+  describe('side-by-side session diffs', function()
+    local SERVER_DEFAULT_DIFF_CONTEXT = '2147483647' -- Signed 32-bit INT_MAX.
+    local directory
+
+    before_each(function()
+      directory = vim.fn.tempname()
+      vim.fn.mkdir(directory, 'p')
+    end)
+
+    after_each(function()
+      vim.fn.delete(directory .. '/before')
+      vim.fn.delete(directory .. '/after')
+      vim.fn.delete(directory, 'd')
+    end)
+
+    it('reconstructs both revisions when the file has separated edits', function()
+      local before = {}
+      for i = 1, 30 do
+        before[i] = 'line ' .. i
+      end
+      local after = vim.deepcopy(before)
+      -- Two separated edits exercise Git's hunk merging; a single edit does not
+      -- reproduce the overflow, even with the same context value.
+      after[3] = 'changed three'
+      after[25] = 'changed twenty-five'
+      vim.fn.writefile(before, directory .. '/before')
+      vim.fn.writefile(after, directory .. '/after')
+
+      transport.request = function(_, request)
+        -- The V2 server defaults to INT_MAX context. Git doubles context while
+        -- merging hunks, which can overflow and produce overlapping hunks that
+        -- cannot reconstruct either revision. Run real Git with the requested
+        -- context (or the server default) so removing the workaround breaks the
+        -- reconstruction assertions below, not just a query-string assertion.
+        local context = request.query:match('context=(%d+)') or SERVER_DEFAULT_DIFF_CONTEXT
+        local result = vim
+          .system({
+            'git',
+            '--no-pager',
+            'diff',
+            '--no-index',
+            '--no-color',
+            '--no-ext-diff',
+            '--no-textconv',
+            '--text',
+            '--diff-algorithm=myers',
+            '--unified=' .. context,
+            '--',
+            'before',
+            'after',
+          }, { cwd = directory, text = true })
+          :wait()
+        assert.equals(1, result.code, result.stderr)
+        return Promise.new():resolve({
+          status = 200,
+          body = vim.json.encode({ data = { { file = '/server/file.lua', patch = result.stdout } } }),
+        })
+      end
+
+      local files = operations.diff_session(ready_connection(), 'ses_123'):wait()
+      local reconstructed_before, reconstructed_after = require('opencode.session_patch').sides(files[1].patch)
+      assert.same(before, reconstructed_before)
+      assert.same(after, reconstructed_after)
+    end)
+  end)
+
   it('uses direct, location/data, and page response contracts from the V2 fixtures', function()
     local bodies = {
-      ['/api/config'] = fixture('config.json'),
       ['/api/location'] = fixture('location.json'),
       ['/api/provider'] = fixture('provider.json'),
       ['/api/session'] = fixture('session.json'),
@@ -238,14 +319,12 @@ describe('V2 protocol operations', function()
       return path:gsub('^/Users/oujinsai', '/host')
     end
 
-    local config = operations.get_config(connection, location, to_server, to_host):wait()
     local project = operations.get_current_project(connection, location, to_server, to_host):wait()
     local providers = operations.list_providers(connection, location, to_server, to_host):wait()
     local sessions = operations.list_sessions(connection, location, nil, 25, to_server, to_host):wait()
     local provider_fixture = vim.json.decode(bodies['/api/provider'])
     local session_fixture = vim.json.decode(bodies['/api/session'])
 
-    assert.equals('/host/.claude', config[1].path)
     assert.equals('/host/Projects/nvim-plugins/opencode.nvim', project.directory)
     assert.same(provider_fixture.location, providers.location)
     assert.same(provider_fixture.data, providers.data)
@@ -253,8 +332,7 @@ describe('V2 protocol operations', function()
     assert.truthy(sessions.cursor.next)
     assert.equals('location%5Bdirectory%5D=%2Fserver%2Fworkspace', calls[1].request.query)
     assert.equals('location%5Bdirectory%5D=%2Fserver%2Fworkspace', calls[2].request.query)
-    assert.equals('location%5Bdirectory%5D=%2Fserver%2Fworkspace', calls[3].request.query)
-    assert.equals('directory=%2Fserver%2Fworkspace&limit=25', calls[4].request.query)
+    assert.equals('directory=%2Fserver%2Fworkspace&limit=25', calls[3].request.query)
   end)
 
   it('extracts the project object from the location envelope without unwrapping its data field', function()
@@ -275,21 +353,64 @@ describe('V2 protocol operations', function()
     assert.equals('/host/project', result.directory)
   end)
 
-  it('does not unwrap a data field from a direct array response', function()
-    transport.request = function()
-      return Promise.new():resolve({
-        status = 200,
-        body = '[{"data":{"belongs":"to-source"},"path":"/server/config.json"}]',
-      })
+  it('resolves effective model defaults rather than treating config sources as config', function()
+    local calls = {}
+    transport.request = function(_, request)
+      calls[#calls + 1] = request
+      local bodies = {
+        ['/api/model/default'] = '{"data":{"providerID":"opencode-go","id":"glm-5.3-flash"}}',
+        ['/api/agent'] = '{"data":[{"id":"orchestrator","model":{"providerID":"custom","id":"agent-model"}},{"id":"build"}]}',
+      }
+      return Promise.new():resolve({ status = 200, body = assert(bodies[request.path]) })
     end
     local result = operations
-      .get_config(ready_connection(), { directory = '/server/project' }, nil, function(path)
-        return path:gsub('^/server', '/host')
+      .get_config(ready_connection(), { directory = '/host/project' }, function(path)
+        return path:gsub('^/host', '/server')
       end)
       :wait()
 
-    assert.same({ belongs = 'to-source' }, result[1].data)
-    assert.equals('/host/config.json', result[1].path)
+    assert.equals('opencode-go/glm-5.3-flash', result.model)
+    assert.equals('custom/agent-model', result.agent.orchestrator.model)
+    assert.same({}, result.agent.build)
+    for _, call in ipairs(calls) do
+      assert.equals('location%5Bdirectory%5D=%2Fserver%2Fproject', call.query)
+    end
+  end)
+
+  it('encodes neutral session selections without overriding explicit creation options', function()
+    local bodies = {}
+    transport.request = function(_, request)
+      bodies[#bodies + 1] = vim.json.decode(request.body)
+      return Promise.new():resolve({ status = 200, body = '{"data":{"id":"new-session"}}' })
+    end
+    local connection = ready_connection()
+    local location = { directory = '/project' }
+    local selected = { mode = 'orchestrator', model = 'opencode-go/glm-5.3-flash', variant = 'high' }
+    operations.create_session(connection, location, { title = 'Default' }, nil, nil, selected):wait()
+    assert.same({
+      title = 'Default',
+      location = location,
+      agent = 'orchestrator',
+      model = { providerID = 'opencode-go', id = 'glm-5.3-flash', variant = 'high' },
+    }, bodies[1])
+
+    local explicit = { agent = 'other', model = { providerID = 'custom', id = 'chosen' } }
+    operations.create_session(connection, location, explicit, nil, nil, selected):wait()
+    assert.same({ agent = 'other', model = explicit.model, location = location }, bodies[2])
+    assert.is_nil(explicit.location)
+
+    operations.create_session(connection, location, { agent = 'other' }, nil, nil, selected):wait()
+    assert.same({ agent = 'other', location = location }, bodies[3])
+  end)
+
+  it('allows effective configuration without a default model', function()
+    transport.request = function(_, request)
+      return Promise.new():resolve({
+        status = 200,
+        body = request.path == '/api/model/default' and '{"data":null}' or '{"data":[]}',
+      })
+    end
+    assert.same({ agent = {} }, operations.get_config(ready_connection(), { directory = '/project' }):wait())
   end)
 
   it('maps business data without changing a provider envelope location', function()
@@ -352,6 +473,7 @@ describe('V2 protocol operations', function()
       :wait()
     local admission = operations
       .submit(connection, 'ses-1', {
+        id = 'msg_client',
         text = 'hello @main.lua',
         context = { { text = 'selected', source = { kind = 'selection', file_name = 'main.lua', range = '1-2' } } },
         files = {
@@ -384,6 +506,7 @@ describe('V2 protocol operations', function()
     )
     assert.equals('/api/session/ses-1/prompt', calls[6].request.path)
     assert.same({
+      id = 'msg_client',
       text = 'hello @main.lua',
       files = {
         {

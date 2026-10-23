@@ -159,6 +159,35 @@ describe('renderer.buffer extmarks', function()
     }, 12)
   end)
 
+  it('passes the explicit context when refreshing fold metadata', function()
+    local ctx = contexts.new()
+    ctx.render_state:set_part({ id = 'part_1', kind = 'text' }, 'msg_1', 'part_1', 0, 3)
+    local formatted = { lines = {}, extmarks = {}, actions = {}, fold_ranges = { { from = 2, to = 4 } } }
+    local update = stub(buffer, 'update_part_folds')
+
+    buffer.refresh_part_metadata('part_1', formatted, { fold_ranges = {} }, ctx)
+
+    assert.stub(update).was_called_with('part_1', false, ctx)
+    update:revert()
+  end)
+
+  it('passes the explicit context when appending folded output', function()
+    local ctx = contexts.new()
+    ctx.render_state:set_part({ id = 'part_1', kind = 'text' }, 'msg_1', 'part_1', 0, 1)
+    ctx.formatted_parts.part_1 = {
+      lines = { 'title', 'body', 'tail' },
+      extmarks = {},
+      actions = {},
+      fold_ranges = { { from = 2, to = 3 } },
+    }
+    local update = stub(buffer, 'update_part_folds')
+
+    buffer.append_part_now('part_1', { 'tail' }, nil, nil, ctx)
+
+    assert.stub(update).was_called_with('part_1', false, ctx)
+    update:revert()
+  end)
+
   it('replaces rendered targets with line offset when updating a part', function()
     contexts.current().render_state:set_part({ id = 'part_1', kind = 'text' }, 'msg_1', 'part_1', 10, 10)
     contexts.current().render_state:add_targets('part_1', {
@@ -221,9 +250,9 @@ describe('update_part_folds', function()
 
     buffer.update_part_folds('part_a')
 
-    assert.stub(set_folds_stub).was_called_with({
-      { from = 10, to = 13 },
-    })
+    -- line_start is a 0-based start index; absolute fold = line_start + relative range.
+    -- (args captured directly: set_folds now takes a trailing force argument)
+    assert.same({ { from = 11, to = 14 } }, set_folds_stub.calls[#set_folds_stub.calls].vals[1])
   end)
 
   it('skips set_folds when fold ranges have not changed', function()
@@ -241,6 +270,65 @@ describe('update_part_folds', function()
     assert.stub(set_folds_stub).was_not_called()
   end)
 
+  it('repairs only the current part when a rewrite keeps the same fold ranges', function()
+    contexts.current().formatted_parts['part_a'] = {
+      lines = { 'title', '', 'content', 'more' },
+      fold_ranges = { { from = 1, to = 4 } },
+    }
+    contexts.current().render_state:set_part({ id = 'part_a', kind = 'text' }, 'msg_1', 'part_a', 10, 14)
+
+    buffer.update_part_folds('part_a')
+    set_folds_stub:clear()
+
+    local repair = stub(output_window, 'repair_folds')
+    buffer.update_part_folds('part_a', true)
+
+    assert.stub(set_folds_stub).was_not_called()
+    assert.same({ { from = 11, to = 14 } }, repair.calls[1].vals[1])
+    repair:revert()
+  end)
+
+  it('does not rebuild history folds across ordinary text streaming rewrites', function()
+    local ctx = contexts.current()
+    ctx.formatted_parts.history = { lines = {}, fold_ranges = { { from = 2, to = 4 } } }
+    ctx.render_state:set_part({ id = 'history', kind = 'tool' }, 'old', 'history', 0, 4)
+    ctx.render_state:set_part({ id = 'text', kind = 'text' }, 'msg', 'text', 5, 5)
+    buffer.set_all_folds()
+    set_folds_stub:clear()
+    local repair = stub(output_window, 'repair_folds')
+    local previous = { lines = { 'start' }, extmarks = {}, actions = {}, fold_ranges = {} }
+    for i = 1, 100 do
+      local formatted = { lines = { 'token ' .. i }, extmarks = {}, actions = {}, fold_ranges = {} }
+      ctx.formatted_parts.text = formatted
+      buffer.upsert_part_now('text', 'msg', formatted, previous)
+      previous = formatted
+    end
+    assert.stub(set_folds_stub).was_not_called()
+    assert.stub(repair).was_not_called()
+    repair:revert()
+  end)
+
+  it('does not rebuild history folds across folded same-line streaming rewrites', function()
+    local ctx = contexts.current()
+    ctx.render_state:set_part({ id = 'tool', kind = 'tool' }, 'msg', 'tool', 0, 2)
+    local previous =
+      { lines = { 'title', 'body', '' }, extmarks = {}, actions = {}, fold_ranges = { { from = 2, to = 3 } } }
+    ctx.formatted_parts.tool = previous
+    buffer.set_all_folds()
+    set_folds_stub:clear()
+    local repair = stub(output_window, 'repair_folds')
+    for i = 1, 100 do
+      local formatted = vim.deepcopy(previous)
+      formatted.lines[2] = 'token ' .. i
+      ctx.formatted_parts.tool = formatted
+      buffer.upsert_part_now('tool', 'msg', formatted, previous)
+      previous = formatted
+    end
+    assert.stub(set_folds_stub).was_not_called()
+    assert.stub(repair).was_called(100)
+    repair:revert()
+  end)
+
   it('merges existing folds from other parts', function()
     contexts.current().formatted_parts['part_b'] = {
       lines = { 'other' },
@@ -256,9 +344,9 @@ describe('update_part_folds', function()
 
     buffer.update_part_folds('part_a')
 
-    assert.stub(set_folds_stub).was_called_with({
-      { from = 5, to = 8 },
-      { from = 10, to = 13 },
-    })
+    assert.same({
+      { from = 6, to = 9 },
+      { from = 11, to = 14 },
+    }, set_folds_stub.calls[#set_folds_stub.calls].vals[1])
   end)
 end)

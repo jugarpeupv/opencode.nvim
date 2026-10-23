@@ -286,6 +286,19 @@ session_handlers['session.usage.updated'] = function(observation, _, data)
   observation:read().session.tokens = tokens
 end
 
+session_handlers['session.revert.staged'] = function(observation, _, data)
+  if type(data.revert) ~= 'table' then
+    return boundary.diagnostic(observation, 'session', 'session.revert.staged is missing revert')
+  end
+  observation:read().session.revert = vim.deepcopy(data.revert)
+  return true
+end
+
+session_handlers['session.revert.cleared'] = function(observation)
+  observation:read().session.revert = nil
+  return true
+end
+
 ---@param observation OpencodeV2Observation
 session_handlers['session.deleted'] = function(observation)
   observation:read().sync.session = lifecycle.sync_error('session_deleted', 'session was deleted')
@@ -385,6 +398,25 @@ local function apply_event(observation, event, route)
   return true
 end
 
+local handled_types_cache
+
+---Every session event type the observation layer dispatches: the route table
+---plus the message resource's own handlers.
+---@return table<string, boolean>
+function M.handled_types()
+  if handled_types_cache then
+    return handled_types_cache
+  end
+  handled_types_cache = {}
+  for event_type in pairs(routes) do
+    handled_types_cache[event_type] = true
+  end
+  for event_type in pairs(messages.handler_types()) do
+    handled_types_cache[event_type] = true
+  end
+  return handled_types_cache
+end
+
 ---@param connection OpencodeV2Connection
 ---@param event OpencodeV2Event
 function M.route(connection, event)
@@ -417,6 +449,11 @@ function M.route(connection, event)
         if apply_event(observation, event, route) or observation:read().sync[resource] ~= previous_sync then
           changed[resource] = true
         end
+      end
+    elseif local_event and event.type:match('^session%.') then
+      local contract = require('opencode.protocols.v2.event_contract')
+      if not M.handled_types()[event.type] and not contract.EXEMPT[event.type] then
+        contract.note_unknown(event.type)
       end
     end
 

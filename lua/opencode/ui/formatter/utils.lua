@@ -3,6 +3,14 @@ local config = require('opencode.config')
 
 local M = {}
 
+---The schema marks a transcript summary on `description`; an empty string means
+---"no summary" just as a missing field does.
+---@param message table
+---@return boolean
+function M.has_description(message)
+  return message.description ~= nil and message.description ~= ''
+end
+
 ---Compute duration text for a tool part, returning nil when not applicable.
 ---@param part table
 ---@return string|nil
@@ -27,24 +35,85 @@ function M.tool_result_text(part)
   return table.concat(text, '\n')
 end
 
+---Pretty-print a tool input table as indented JSON lines. String values keep
+---their JSON escaping; nested tables expand so long inputs become foldable.
+---@param value any
+---@param indent string
+---@return string[]
+local function pretty_json_lines(value, indent)
+  if type(value) ~= 'table' then
+    return { vim.json.encode(value) }
+  end
+  local lines
+  if vim.isarray(value) then
+    if #value == 0 then
+      return { '[]' }
+    end
+    lines = { '[' }
+    for i, item in ipairs(value) do
+      local nested = pretty_json_lines(item, indent .. '  ')
+      lines[#lines + 1] = indent .. '  ' .. nested[1]
+      for j = 2, #nested do
+        lines[#lines + 1] = nested[j]
+      end
+      if i < #value then
+        lines[#lines] = lines[#lines] .. ','
+      end
+    end
+    lines[#lines + 1] = indent .. ']'
+    return lines
+  end
+  local keys = vim.tbl_keys(value)
+  table.sort(keys, function(a, b)
+    return tostring(a) < tostring(b)
+  end)
+  lines = { '{' }
+  for i, key in ipairs(keys) do
+    local nested = pretty_json_lines(value[key], indent .. '  ')
+    lines[#lines + 1] = indent .. '  ' .. vim.json.encode(tostring(key)) .. ': ' .. nested[1]
+    for j = 2, #nested do
+      lines[#lines + 1] = nested[j]
+    end
+    if i < #keys then
+      lines[#lines] = lines[#lines] .. ','
+    end
+  end
+  lines[#lines + 1] = indent .. '}'
+  return lines
+end
+
+---Render a tool input table as pretty-printed JSON lines.
+---@param input? table
+---@return string[]
+function M.format_tool_input_lines(input)
+  if not input or next(input) == nil then
+    return {}
+  end
+  return pretty_json_lines(input, '')
+end
+
 ---@param output Output
 ---@param input? table
-function M.format_tool_input(output, input)
+---@param opts? {collapsed?: boolean}
+function M.format_tool_input(output, input, opts)
   local tools = config.ui.output.tools
-  if not input or next(input) == nil or not (tools.show_output or tools.use_folds) then
+  local show = tools.show_output and not (opts and opts.collapsed)
+  if not input or next(input) == nil or not (show or tools.use_folds) then
     return
   end
   output:add_empty_line()
   local start_line = output:add_line('**Input**')
-  M.format_code(output, vim.split(vim.json.encode(input), '\n'), 'json')
-  output:add_fold_with_threshold(start_line, tools.show_output, tools.use_folds)
+  M.format_code(output, M.format_tool_input_lines(input), 'json')
+  output:add_fold_with_threshold(start_line, show, tools.use_folds)
 end
 
 ---@param output Output
 ---@param part {result?: OpencodeV2NormalizedToolResult[]}
-function M.format_tool_result(output, part)
+---@param opts? {collapsed?: boolean}
+function M.format_tool_result(output, part, opts)
   local tools = config.ui.output.tools
-  if not (tools.show_output or tools.use_folds) then
+  local show = tools.show_output and not (opts and opts.collapsed)
+  if not (show or tools.use_folds) then
     return
   end
 
@@ -85,8 +154,52 @@ function M.format_tool_result(output, part)
     end
   end
   if start_line then
-    output:add_fold_with_threshold(start_line, tools.show_output, tools.use_folds)
+    output:add_fold_with_threshold(start_line, show, tools.use_folds)
   end
+end
+
+---@param result OpencodeV2BackgroundResult
+---@return string label
+---@return boolean failed
+function M.background_outcome(result)
+  if result.timeout then
+    return 'timed out', true
+  elseif result.signal then
+    return 'killed by ' .. result.signal, true
+  elseif result.state == 'cancelled' then
+    return 'cancelled', true
+  elseif result.state == 'error' then
+    return 'failed', true
+  elseif result.exit ~= nil and result.exit ~= 0 then
+    return 'exit ' .. result.exit, true
+  end
+  return 'done', false
+end
+
+---@param output Output
+---@param line_idx integer 1-based header line
+---@param part {background: {id: string}}
+---@param context? FormatterContext
+---@return OpencodeV2BackgroundResult|nil result The job outcome, once known
+function M.format_background_badge(output, line_idx, part, context)
+  local result = context and context.get_background_result and context.get_background_result(part.background.id)
+  local extmark
+  if result then
+    local label, failed = M.background_outcome(result)
+    local hl = failed and 'OpencodeBackgroundBadgeFailed' or 'OpencodeBackgroundBadge'
+    extmark = { virt_text = { { ' Background · ' .. label .. ' ', hl } }, virt_text_pos = 'eol' }
+  elseif context and context.interactive then
+    local hl = 'OpencodeBackgroundBadge'
+    extmark = {
+      virt_text = { { ' ', hl }, { '', hl }, { ' Background ', hl } },
+      virt_text_pos = 'eol',
+      spinner_chunk = 2,
+    }
+  else
+    extmark = { virt_text = { { ' Background ', 'OpencodeBackgroundBadge' } }, virt_text_pos = 'eol' }
+  end
+  output:add_extmark(line_idx - 1, extmark --[[@as OutputExtmark]])
+  return result
 end
 
 ---@param session_id string
@@ -132,7 +245,7 @@ function M.add_tool_diff_action(output, message, context, path, first_line, last
   if not context or not context.interactive or not message then
     return
   end
-  local connection = require('opencode.state').opencode_server
+  local connection = require('opencode.state.store').get('opencode_server')
   if not connection or connection.protocol ~= 'v2' then
     return
   end

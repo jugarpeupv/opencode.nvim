@@ -4,7 +4,7 @@ local M = {}
 ---@class OpencodeStateData
 ---@field windows OpencodeWindowState|nil
 ---@field is_opening boolean
----@field input_content table
+---@field input_content string[]
 ---@field is_opencode_focused boolean
 ---@field last_focused_opencode_window string|nil
 ---@field last_input_window_position integer[]|nil
@@ -40,6 +40,7 @@ local M = {}
 ---@field _hidden_buffers OpencodeHiddenBuffers|nil
 ---@field active_session_tab string|nil
 ---@field session_tabs_changed number
+---@field optimistic_revision number
 
 ---@type OpencodeStateData
 local _state = {
@@ -80,6 +81,7 @@ local _state = {
   _hidden_buffers = nil,
   active_session_tab = nil,
   session_tabs_changed = 0,
+  optimistic_revision = 0,
 }
 
 local _listeners = {}
@@ -264,14 +266,17 @@ function M.emit(key, new_val, old_val)
       for _, cb in ipairs(_listeners[key]) do
         local ok, err = pcall(cb, key, new_val, old_val)
         if not ok then
-          vim.notify(err --[[@as string]])
+          vim.notify(tostring(err))
         end
       end
     end
 
     if _listeners['*'] then
       for _, cb in ipairs(_listeners['*']) do
-        pcall(cb, key, new_val, old_val)
+        local ok, err = pcall(cb, key, new_val, old_val)
+        if not ok then
+          vim.notify(tostring(err))
+        end
       end
     end
   end)

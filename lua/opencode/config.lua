@@ -6,13 +6,13 @@ local M = {}
 ---@type OpencodeConfig
 M.defaults = {
   preferred_picker = nil,
-  preferred_completion = nil,
   default_global_keymaps = true,
   default_mode = 'build',
   default_system_prompt = nil,
   keymap_prefix = '<leader>o',
   opencode_executable = 'opencode',
   lock_session_to_directory = false,
+  program_status = { enabled = true, tmux = false },
   server = {
     url = nil,
     port = nil,
@@ -240,6 +240,7 @@ M.defaults = {
     notify_on_background_prompt = true,
     window_highlight = 'Normal:OpencodeBackground,FloatBorder:OpencodeBorder',
     persist_state = true,
+    restore_tabs_on_startup = true,
     icons = {
       preset = 'nerdfonts',
       overrides = {},
@@ -273,6 +274,8 @@ M.defaults = {
         -- Reduced default threshold to make small tool outputs foldable by default.
         -- Users can override this in their config if they prefer the previous value.
         folding_threshold = 25,
+        -- Keep trailing content visible while a folded tool or reasoning part streams; 0 disables.
+        streaming_preview_lines = 1,
       },
 
       max_messages = nil,

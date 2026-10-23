@@ -2,6 +2,7 @@ local state = require('opencode.state')
 local config = require('opencode.config')
 local output_window = require('opencode.ui.output_window')
 local reference_facts = require('opencode.ui.reference_facts')
+local formatter_utils = require('opencode.ui.formatter.utils')
 local contexts = require('opencode.ui.renderer.ctx')
 local RenderSession = require('opencode.ui.renderer.session')
 local flush = require('opencode.ui.renderer.flush')
@@ -9,6 +10,7 @@ local rendered_entries = require('opencode.ui.renderer.entries')
 local symbol_refresh = require('opencode.ui.renderer.symbol_refresh')
 local scroll = require('opencode.ui.renderer.scroll')
 local session_tabs = require('opencode.state.session_tabs')
+local optimistic = require('opencode.state.optimistic')
 
 local M = {}
 local REVERT_MESSAGE_ID = '__opencode_revert_message__'
@@ -66,7 +68,12 @@ end
 ---@param message table
 ---@return boolean
 local function is_non_conversation_record(message)
-  return message.kind == 'agent-switched' or message.kind == 'model-switched' or message.kind == 'synthetic'
+  -- A synthetic message is transcript-visible through its `description` (the
+  -- schema's summary field) or a background result; otherwise its text is
+  -- model-facing payload.
+  return message.kind == 'agent-switched'
+    or message.kind == 'model-switched'
+    or (message.kind == 'synthetic' and not formatter_utils.has_description(message) and not message.background_result)
 end
 
 ---@param message table|nil
@@ -136,7 +143,11 @@ local function get_visible_session_messages(messages, session, ctx)
   local real_messages = get_real_session_messages(messages)
   local revert_index = get_revert_index(messages, session)
   if revert_index then
+    local pending = vim.tbl_filter(function(message)
+      return message.local_status ~= nil
+    end, real_messages)
     real_messages = vim.list_slice(real_messages, 1, revert_index - 1)
+    vim.list_extend(real_messages, pending)
   end
 
   local limit = not ctx.history_expanded and get_max_rendered_messages()
@@ -322,7 +333,7 @@ local function ordered_entries(observation)
       entries[#entries + 1] = entry
     end
   end
-  return entries
+  return optimistic.project(observation, entries)
 end
 
 local function total_tokens(tokens)
@@ -499,7 +510,7 @@ local function read_conversation(ctx, observation)
   local sync = observed.sync or {}
   local synced_session = sync.session and sync.session.state == 'current' and observed.session or nil
   local entries = ordered_entries(observation)
-  ctx.entries = entries
+  ctx:set_entries(entries)
   update_observation_stats(observation)
   return synced_session or { id = state.active_session and state.active_session.id }, entries
 end
@@ -512,7 +523,7 @@ local function has_pending_local_submission(ctx, entries)
     if
       entry.kind == 'user'
       and not ctx.render_state:get_message(entry.id)
-      and (state.user_message_count[entry.session_id] or 0) > 0
+      and (entry.local_status == 'sending' or (state.user_message_count[entry.session_id] or 0) > 0)
     then
       return true
     end
@@ -812,7 +823,7 @@ local function grow_window_with_older_page(ctx)
     if #ordered_entries(observation) <= entries_before then
       return
     end
-    ctx.entries = ordered_entries(observation)
+    ctx:set_entries(ordered_entries(observation))
     if not apply_window_growth(ctx, window_before + get_initial_render_count()) then
       -- the window already covered everything cached: drop the window limit
       -- so the merged prefix renders, without pulling more pages
@@ -854,7 +865,7 @@ local function load_complete_history(ctx, scroll_to_top)
       end
       -- grow to the merged total only; the rendering primitive does not
       -- touch the protocol, so this callback cannot re-enter the pull
-      ctx.entries = ordered_entries(observation)
+      ctx:set_entries(ordered_entries(observation))
       apply_window_growth(ctx, math.huge)
       if scroll_to_top and win and vim.api.nvim_win_is_valid(win) then
         pcall(vim.api.nvim_win_set_cursor, win, { 1, 0 })
@@ -909,14 +920,23 @@ function M.setup_subscriptions(subscribe, ctx)
     state.store.subscribe('last_focused_opencode_window', M.on_focus_changed)
     state.store.subscribe('active_session', M.on_session_changed)
     state.store.subscribe('active_session_tab', M.on_session_tab_changed)
+    state.store.subscribe('optimistic_revision', M.on_optimistic_changed)
   else
     state.store.unsubscribe('is_opencode_focused', M.on_focus_changed)
     state.store.unsubscribe('last_focused_opencode_window', M.on_focus_changed)
     state.store.unsubscribe('active_session', M.on_session_changed)
     state.store.unsubscribe('active_session_tab', M.on_session_tab_changed)
+    state.store.unsubscribe('optimistic_revision', M.on_optimistic_changed)
   end
   if subscribe and state.active_session then
     M.on_session_changed(nil, state.active_session, nil, ctx)
+  end
+end
+
+function M.on_optimistic_changed()
+  local ctx = contexts.current()
+  if ctx.observation then
+    reconcile_observation(ctx, ctx.observation, { messages = true })
   end
 end
 
@@ -937,7 +957,7 @@ function M._render_full_session_data(entries, session, ctx, opts)
   if ctx.observation then
     update_observation_stats(ctx.observation)
   end
-  ctx.entries = entries or {}
+  ctx:set_entries(entries or {})
   session = session or current_session(ctx)
   reference_facts.rebuild(session.id, ctx.entries, session.location)
   local visible_messages, hidden_count = get_visible_session_messages(ctx.entries, session, ctx)

@@ -59,6 +59,34 @@ local function event(session_id, kind, data, created)
 end
 
 describe('V2 protocol Observation interpretation', function()
+  it('normalizes completed question text into the shared reply contract', function()
+    local native = assistant('msg-question')
+    native.content = {
+      {
+        type = 'tool',
+        id = 'call-question',
+        name = 'question',
+        time = { created = 1 },
+        state = {
+          status = 'completed',
+          input = {},
+          content = {
+            { type = 'text', text = 'First reply' },
+            { type = 'file', uri = 'file:///tmp/reply.txt', mime = 'text/plain' },
+            { type = 'text', text = 'Second reply\nMore detail' },
+          },
+        },
+      },
+    }
+    local normalize = require('opencode.protocols.v2.normalize')
+    local entry = normalize.mapped_message('ses-question', native)
+    assert.equals('First reply\nSecond reply\nMore detail', entry.content[1].answer_text)
+
+    native.content[1].state = { status = 'running', input = {} }
+    entry = normalize.mapped_message('ses-question', native)
+    assert.is_nil(entry.content[1].answer_text)
+  end)
+
   it('preserves native skill attachments while preparing a message', function()
     local observed = observation('ses-skill')
     local skills = { { id = 'skill-id', mention = { start_byte = 0, end_byte = 7 } } }
@@ -87,6 +115,111 @@ describe('V2 protocol Observation interpretation', function()
     observed._start_resource = original_refresh
   end)
 
+  it('refreshes messages when a background completion notification arrives', function()
+    local observed = observation('ses-bg')
+    local original = observed._start_resource
+    local refreshed
+    observed._start_resource = function(_, resource)
+      refreshed = resource
+    end
+
+    assert.is_true(observation_module.ingest_event(
+      observed,
+      event('ses-bg', 'session.synthetic', {
+        text = '<shell id="sh_1" state="completed" command="make build">\nexit 0\n</shell>',
+        metadata = { source = 'shell', shellID = 'sh_1', state = 'completed', exit = 0 },
+      })
+    ))
+    assert.equals('messages', refreshed)
+    assert.equals('stale', observed:read().sync.messages.state)
+
+    observed._start_resource = original
+  end)
+
+  it('records background completions steered through the inbox of a busy session', function()
+    local observed = observation('ses-bg')
+    observation_module.ingest_snapshot(observed, {
+      {
+        id = 'msg-assistant',
+        type = 'assistant',
+        agent = 'build',
+        model = { providerID = 'provider', id = 'model' },
+        time = { created = 200 },
+        content = {
+          {
+            type = 'tool',
+            id = 'call-shell',
+            name = 'shell',
+            executed = true,
+            time = { created = 201 },
+            state = {
+              status = 'completed',
+              input = { command = 'make build', background = true },
+              metadata = { status = 'running', truncated = false, shellID = 'sh_1' },
+              content = {},
+            },
+          },
+        },
+      },
+    })
+    local background_tasks = require('opencode.services.background_tasks')
+    assert.equals(1, background_tasks.count_observed(observed).shells)
+
+    assert.is_true(observation_module.ingest_event(
+      observed,
+      event('ses-bg', 'session.inbox.enqueued', {
+        inboxID = 'msg-completion',
+        item = {
+          type = 'synthetic',
+          payload = {
+            text = '<shell id="sh_1" state="completed" command="make build">\nbuilt\n</shell>',
+            description = 'make build',
+            metadata = { source = 'shell', shellID = 'sh_1', jobID = 'sh_1', state = 'completed', exit = 0 },
+          },
+          delivery = 'steer',
+        },
+      })
+    ))
+
+    local completion = observed:read().entries_by_id['msg-completion']
+    assert.equals('sh_1', completion.background_result.id)
+    assert.equals('built', completion.background_result.text)
+    assert.equals(0, background_tasks.count_observed(observed).total)
+  end)
+
+  it('ignores inbox synthetic items that are not background completions', function()
+    local observed = observation('ses-bg')
+
+    assert.is_false(observation_module.ingest_event(
+      observed,
+      event('ses-bg', 'session.inbox.enqueued', {
+        inboxID = 'msg-context',
+        item = { type = 'synthetic', payload = { text = 'embedded context', metadata = { source = 'acp' } } },
+      })
+    ))
+    assert.is_nil(observed:read().entries_by_id['msg-context'])
+  end)
+
+  it('ignores synthetic messages that are not background completions', function()
+    local observed = observation('ses-bg')
+    local original = observed._start_resource
+    local refreshed
+    observed._start_resource = function(_, resource)
+      refreshed = resource
+    end
+
+    assert.is_false(observation_module.ingest_event(
+      observed,
+      event('ses-bg', 'session.synthetic', {
+        text = 'embedded context',
+        metadata = { source = 'acp' },
+      })
+    ))
+    assert.is_nil(refreshed)
+
+    observed._start_resource = original
+  end)
+
   it('validates a complete snapshot before replacing existing entries', function()
     local observed = observation('ses-target')
     local message = assistant('msg-assistant')
@@ -111,6 +244,17 @@ describe('V2 protocol Observation interpretation', function()
     observation_module.ingest_snapshot(observed, { replacement })
     assert.equals(entry, state.entries_by_id['msg-assistant'])
     assert.equals(99, entry.cost)
+  end)
+
+  it('rejects a message id with a colon, which would make synthesized part ids ambiguous', function()
+    local observed = observation('ses-target')
+    observation_module.ingest_snapshot(observed, { assistant('msg-assistant') })
+
+    local ok, err = pcall(observation_module.ingest_snapshot, observed, { assistant('msg:collide') })
+
+    assert.is_false(ok)
+    assert.matches('message id must not contain', tostring(err))
+    assert.same({ 'msg-assistant' }, observed:read().entry_order)
   end)
 
   it('projects newest-first native snapshots into chronological frozen facts', function()
@@ -151,8 +295,11 @@ describe('V2 protocol Observation interpretation', function()
     assert.same({ created = 200, streamed = 220, completed = 240 }, reply.time)
     assert.same({ start = 'snap-start', ['end'] = 'snap-end', files = { 'main.lua' } }, reply.snapshot)
     assert.same({ input = 10, output = 5, reasoning = 2, cache = { read = 3, write = 1 } }, reply.tokens)
+    assert.equals('msg-assistant:reasoning:0', reply.content[1].id)
+    assert.equals('msg-assistant:text:0', reply.content[2].id)
     local tool = reply.content[3]
-    assert.equals('tool-1', tool.id)
+    assert.equals('msg-assistant:tool:tool-1', tool.id)
+    assert.equals('tool-1', tool.call_id)
     assert.equals('completed', tool.state)
     assert.is_nil(tool.metadata)
     assert.same({ { path = 'main.lua', diff = '@@ -9,1 +9,1 @@\n-old\n+new' } }, tool.changes)
@@ -452,7 +599,44 @@ describe('V2 protocol Observation interpretation', function()
     assert.equals('from another client', observed:read().entries_by_id['msg-user'].content[1].text)
   end)
 
-  it('applies native text, reasoning, and tool lifecycles without synthetic identities', function()
+  it('projects restart and instruction notices into messages', function()
+    local observed = observation('ses-notice')
+
+    local restart = event('ses-notice', 'session.synthetic', {
+      text = 'The server restarted while you were working.',
+      description = 'Continuing after restart',
+    }, 100)
+    restart.id = 'evt_restart'
+    assert.is_true(observation_module.ingest_event(observed, restart))
+
+    local instructions = event('ses-notice', 'session.instructions.updated', {
+      delta = { ['core/mcp-guidance'] = 'hash-b', ['core/codemode'] = 'hash-a' },
+      text = 'The available MCP server instructions have changed.',
+    }, 101)
+    instructions.id = 'evt_instructions'
+    assert.is_true(observation_module.ingest_event(observed, instructions))
+
+    local state = observed:read()
+    assert.same({ 'msg_restart', 'msg_instructions' }, state.entry_order)
+    local synthetic = state.entries_by_id['msg_restart']
+    assert.equals('synthetic', synthetic.kind)
+    assert.equals('Continuing after restart', synthetic.description)
+    assert.equals('The server restarted while you were working.', synthetic.content[1].text)
+    local system = state.entries_by_id['msg_instructions']
+    assert.equals('system', system.kind)
+    assert.equals('Instructions updated: core/codemode, core/mcp-guidance', system.description)
+  end)
+
+  it('ignores instruction updates that carry no rendered text', function()
+    local observed = observation('ses-notice')
+    local baseline = event('ses-notice', 'session.instructions.updated', {
+      delta = { ['core/codemode'] = 'hash-a' },
+    }, 100)
+    assert.is_false(observation_module.ingest_event(observed, baseline))
+    assert.same({}, observed:read().entry_order)
+  end)
+
+  it('applies native text, reasoning, and tool lifecycles with synthesized identities', function()
     local observed = observation('ses-target')
     assert.is_true(observation_module.ingest_event(
       observed,
@@ -538,8 +722,11 @@ describe('V2 protocol Observation interpretation', function()
     assert.equals('AR', entry.content[1].text)
     assert.equals('BT', entry.content[2].text)
     assert.equals('C', entry.content[3].text)
-    assert.is_nil(entry.content[1].id)
-    assert.is_nil(entry.content[2].id)
+    assert.equals('msg-live:reasoning:0', entry.content[1].id)
+    assert.equals('msg-live:text:0', entry.content[2].id)
+    assert.equals('msg-live:reasoning:1', entry.content[3].id)
+    assert.equals('msg-live:tool:tool-live', entry.content[4].id)
+    assert.equals('tool-live', entry.content[4].call_id)
     assert.equals('completed', entry.content[4].state)
     assert.is_nil(entry.content[4].metadata)
     assert.same({ { path = 'live.lua', diff = '@@ -3,1 +3,1 @@\n-old\n+new' } }, entry.content[4].changes)
@@ -633,6 +820,133 @@ describe('V2 protocol Observation interpretation', function()
     assert.is_nil(observed:read().entries_by_id['msg-missing'])
     assert.matches('no assistant message', observed:read().sync.messages.error.message)
   end)
+  it('keeps synthesized part identity stable across the event-to-snapshot handoff', function()
+    local observed = observation('ses-target')
+    observation_module.ingest_event(
+      observed,
+      event('ses-target', 'session.step.started', {
+        assistantMessageID = 'msg-mix',
+        agent = 'build',
+        model = { providerID = 'p', id = 'm' },
+      })
+    )
+    observation_module.ingest_event(
+      observed,
+      event('ses-target', 'session.text.started', { assistantMessageID = 'msg-mix', ordinal = 0 })
+    )
+    observation_module.ingest_event(
+      observed,
+      event('ses-target', 'session.text.delta', { assistantMessageID = 'msg-mix', ordinal = 0, delta = 'T0' })
+    )
+    observation_module.ingest_event(
+      observed,
+      event(
+        'ses-target',
+        'session.tool.input.started',
+        { assistantMessageID = 'msg-mix', id = 'tool-mix', name = 'bash' }
+      )
+    )
+    observation_module.ingest_event(
+      observed,
+      event('ses-target', 'session.reasoning.started', { assistantMessageID = 'msg-mix', ordinal = 0 })
+    )
+    observation_module.ingest_event(
+      observed,
+      event('ses-target', 'session.text.started', { assistantMessageID = 'msg-mix', ordinal = 1 })
+    )
+
+    local entry = observed:read().entries_by_id['msg-mix']
+    assert.same(
+      { 'text', 'tool', 'reasoning', 'text' },
+      vim.tbl_map(function(content)
+        return content.kind
+      end, entry.content)
+    )
+    assert.same(
+      {
+        'msg-mix:text:0',
+        'msg-mix:tool:tool-mix',
+        'msg-mix:reasoning:0',
+        'msg-mix:text:1',
+      },
+      vim.tbl_map(function(content)
+        return content.id
+      end, entry.content)
+    )
+
+    observation_module.ingest_snapshot(observed, {
+      {
+        id = 'msg-mix',
+        type = 'assistant',
+        agent = 'build',
+        model = { providerID = 'p', id = 'm' },
+        time = { created = 300, completed = 400 },
+        snapshot = {},
+        content = {
+          { type = 'text', text = 'snap-t0' },
+          {
+            type = 'tool',
+            id = 'tool-mix',
+            name = 'bash',
+            time = { created = 310 },
+            state = { status = 'running', input = { command = 'ls' } },
+          },
+          { type = 'reasoning', text = 'snap-r0' },
+          { type = 'text', text = 'snap-t1' },
+        },
+      },
+    })
+    local replaced = observed:read().entries_by_id['msg-mix']
+    assert.same(
+      {
+        'msg-mix:text:0',
+        'msg-mix:tool:tool-mix',
+        'msg-mix:reasoning:0',
+        'msg-mix:text:1',
+      },
+      vim.tbl_map(function(content)
+        return content.id
+      end, replaced.content)
+    )
+
+    assert.is_true(
+      observation_module.ingest_event(
+        observed,
+        event('ses-target', 'session.text.delta', { assistantMessageID = 'msg-mix', ordinal = 0, delta = '!' })
+      )
+    )
+    assert.is_true(
+      observation_module.ingest_event(
+        observed,
+        event('ses-target', 'session.text.ended', { assistantMessageID = 'msg-mix', ordinal = 0, text = 'T0-final' })
+      )
+    )
+    assert.equals('T0-final', replaced.content[1].text)
+    assert.equals('msg-mix:text:0', replaced.content[1].id)
+    assert.equals('snap-t1', replaced.content[4].text)
+
+    assert.is_true(observation_module.ingest_event(
+      observed,
+      event('ses-target', 'session.tool.called', {
+        assistantMessageID = 'msg-mix',
+        id = 'tool-mix',
+        input = { command = 'ls -a' },
+        executed = false,
+      })
+    ))
+    assert.is_true(observation_module.ingest_event(
+      observed,
+      event('ses-target', 'session.tool.success', {
+        assistantMessageID = 'msg-mix',
+        id = 'tool-mix',
+        executed = true,
+        content = { { type = 'text', text = 'done' } },
+      })
+    ))
+    assert.equals('msg-mix:tool:tool-mix', replaced.content[2].id)
+    assert.equals('tool-mix', replaced.content[2].call_id)
+    assert.equals('completed', replaced.content[2].state)
+  end)
 end)
 
 describe('V2 protocol editor-context attachments', function()
@@ -674,9 +988,11 @@ describe('V2 protocol editor-context attachments', function()
     local context_entry = entry.content[2]
     assert.same('editor_context', context_entry.kind)
     assert.is_true(context_entry.synthetic)
+    assert.equals('msg-user:file:1', context_entry.id)
     assert.same('selection', context_entry.source.kind)
     assert.same('test.py', context_entry.source.file_name)
     assert.same('1-2', context_entry.source.range)
     assert.same('selected code', context_entry.text)
+    assert.equals('msg-user:file:2', entry.content[3].id)
   end)
 end)

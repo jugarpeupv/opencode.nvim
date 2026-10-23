@@ -3,6 +3,7 @@ local loading_animation = require('opencode.ui.loading_animation')
 local footer = require('opencode.ui.footer')
 local assert = require('luassert')
 local support = require('tests.unit.services_spec_support')
+local optimistic = require('opencode.state.optimistic')
 
 describe('loading_animation', function()
   local original
@@ -16,8 +17,10 @@ describe('loading_animation', function()
     local watcher
     local releases = 0
     observation.watch = function(_, resources, changed)
-      assert.same({ 'execution' }, resources)
-      watcher = changed
+      if resources[1] == 'execution' then
+        assert.same({ 'execution', 'messages' }, resources)
+        watcher = changed
+      end
       local active = true
       return function()
         if active then
@@ -85,6 +88,16 @@ describe('loading_animation', function()
   end)
 
   describe('_should_animate', function()
+    it('animates before server execution and stops on failed send', function()
+      state.session.set_active({ id = 'ses_pending' })
+      local observation = state.session.active_observation()
+      local pending = optimistic.begin(observation, 'hello')
+      assert.is_true(loading_animation._should_animate())
+      assert.equals('Sending... ', loading_animation._get_display_text())
+      optimistic.finish(observation, pending, 'failed')
+      assert.is_false(loading_animation._should_animate())
+    end)
+
     it('requires a running or retrying execution for the active session', function()
       state.session.set_active({ id = 'ses_a' })
       loading_animation._animation.session_id = 'ses_a'

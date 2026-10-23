@@ -9,10 +9,30 @@ local Promise = require('opencode.promise')
 local log = require('opencode.log')
 local agent_model = require('opencode.services.agent_model')
 local session_tabs = require('opencode.state.session_tabs')
+local tab_persistence = require('opencode.services.session_tab_persistence')
 
 local M = {}
 
 local active_binding
+local directory_change_generation = 0
+local group_panel_visible = false
+
+---@class OpencodeSessionLease
+---@field session {id: string, location?: OpencodeLocation}
+---@field observation OpencodeObservation
+---@field connection OpencodeServer
+---@field release fun() Idempotent; call after the operation completes, including failures.
+
+---@class OpencodeDraftCreation
+---@field result Promise<OpencodeDetachedSession|nil>
+---@field ready Promise<boolean>
+---@field cancelled boolean
+---@field users integer
+---@field unsubscribe? fun()
+---@field cancel fun()
+
+---@type table<string, OpencodeDraftCreation>
+local draft_creations = {}
 
 local function release_active_observation()
   local previous = active_binding
@@ -86,7 +106,7 @@ local function observe_active_session()
           end
         end)
         :catch(function(err)
-          log.debug('Failed to restore session model', { session_id = session_id, error = err })
+          log.warn('Failed to restore session model for %s: %s', session_id, tostring(err))
         end)
         :finally(function()
           binding.restoring_model = false
@@ -122,6 +142,34 @@ function M.setup_done_thinking_events(subscribe)
   })
 end
 
+---@param enable boolean|nil
+local function setup_model_sync_events(enable)
+  vim.api.nvim_create_augroup('opencode_model_sync', { clear = true })
+  if not enable then
+    return
+  end
+  vim.api.nvim_create_autocmd('User', {
+    group = 'opencode_model_sync',
+    pattern = {
+      'OpencodeEvent:session.model.selected',
+      'OpencodeEvent:session.agent.selected',
+    },
+    callback = function(args)
+      local event = args.data and args.data.event
+      local props = event and event.properties
+      local session = state.active_session
+      if not (props and props.sessionID and session and props.sessionID == session.id) then
+        return
+      end
+      if event.type == 'session.agent.selected' then
+        agent_model.apply_server_agent(props.agent)
+      else
+        agent_model.apply_server_selection(props.model)
+      end
+    end,
+  })
+end
+
 ---Keep active-session metadata and model selection current independently of rendering.
 ---Disabling releases the observation; enabling also adopts already-loaded facts.
 ---@param subscribe? boolean Defaults to true
@@ -139,6 +187,7 @@ function M.setup_subscriptions(subscribe)
   else
     observe_active_session()
   end
+  setup_model_sync_events(subscribe ~= false)
 end
 
 local function current_location()
@@ -309,6 +358,13 @@ end
 
 M.check_cwd = function()
   local runtime = session_tabs.current()
+  if config.ui.restore_tabs_on_startup then
+    if runtime and runtime.bound_directory then
+      runtime.bound_editor_cwd = vim.fn.getcwd()
+      state.context.set_current_cwd(runtime.bound_directory)
+    end
+    return
+  end
   if runtime and runtime.bound_directory then
     local cwd = vim.fn.getcwd()
     if runtime.bound_editor_cwd == cwd or M.is_session_locked(cwd) then
@@ -334,9 +390,24 @@ M.check_cwd = function()
   end
 end
 
+local function prepare_group_switch()
+  group_panel_visible = group_panel_visible or state.ui.is_visible()
+  state.ui.set_opening(false)
+  session_tabs.set_context(context.snapshot())
+  if state.ui.is_visible() then
+    ui.prepare_session_tab_switch()
+    ui.hide_visible_windows(state.windows, true)
+  end
+  session_tabs.sync()
+end
+
 ---@param opts? OpenOpts
 M.open = Promise.async(function(opts)
   opts = opts or { focus = 'input', new_session = false }
+  local editor_cwd = vim.fs.normalize(vim.fn.getcwd())
+  local existing_tab = session_tabs.current()
+  local tabs_initialized = not config.ui.restore_tabs_on_startup or tab_persistence.is_initialized()
+  local draft_tab_id = tabs_initialized and existing_tab and not state.active_session and existing_tab.id
 
   session_tabs.ensure_current()
   session_tabs.set_context(context.snapshot())
@@ -345,7 +416,27 @@ M.open = Promise.async(function(opts)
 
   local created_windows
   local server_ok, server = pcall(function()
+    local previous = session_tabs.current()
+    local pinned = state.active_session and M.is_session_locked() and tab_persistence.is_initialized()
+    local restoring
+    if not pinned then
+      restoring = tab_persistence.restore(opts.new_session == true, prepare_group_switch)
+    end
+    if restoring then
+      restoring:await()
+    end
+    if vim.fs.normalize(vim.fn.getcwd()) ~= editor_cwd then
+      error('Working directory changed while opening panel')
+    end
+    local switched = session_tabs.current() ~= previous
+    if switched then
+      context.restore(session_tabs.get_context())
+    end
+    state.ui.set_opening(true)
     local open_action = opts.open_action or state.ui.resolve_open_windows_action()
+    if switched and open_action == 'reuse_visible' then
+      open_action = state.ui.resolve_open_windows_action()
+    end
     if opts.new_session then
       context.clear_files()
       context.clear_selections()
@@ -357,6 +448,7 @@ M.open = Promise.async(function(opts)
       M.is_prompting_allowed()
     end
     created_windows = ui.prepare_windows(open_action, opts)
+    group_panel_visible = false
     return server_job.ensure_server():await()
   end)
   if not server_ok then
@@ -375,15 +467,20 @@ M.open = Promise.async(function(opts)
     if opts.new_session then
       state.session.clear_active()
       agent_model.ensure_current_mode():await()
-      state.session.set_active(M.create_new_session():await())
-      log.debug('Created new session on open', { session = state.active_session.id })
     else
       agent_model.ensure_current_mode():await()
-      if not state.active_session then
-        state.session.set_active(last_workspace_session():await())
-        if not state.active_session then
-          state.session.set_active(M.create_new_session():await())
+      -- Reopening an intentional draft must not adopt another tab's recent session.
+      local preserve_draft = draft_tab_id and session_tabs.active_id() == draft_tab_id
+      if not state.active_session and not opts.draft and not preserve_draft then
+        local resumed, recent = pcall(function()
+          return last_workspace_session():await()
+        end)
+        if not resumed then
+          log.warn('Failed to resume the most recent session: ' .. tostring(recent))
+        elseif recent then
+          state.session.set_active(recent)
         end
+        -- No server session here: the first prompt creates one (messaging.send_message).
       elseif not state.display_route and created_windows and ui.is_output_empty() then
         ui.render_output()
       end
@@ -398,10 +495,17 @@ M.open = Promise.async(function(opts)
     vim.notify('Error opening panel: ' .. tostring(err), vim.log.levels.ERROR)
     return Promise.new():reject(err)
   end
+
+  -- Re-sync model/variant from the server: switch events only carry increments,
+  -- so anything the user changed in the TUI while this client was unfocused
+  -- converges only through this GET on open.
+  agent_model.sync_from_server()
+
   return Promise.new():resolve('ok')
 end)
 
-local create_session = Promise.async(function(connection, location, title_or_opts)
+---@param selected? OpencodeSessionSelection
+local create_session = Promise.async(function(connection, location, title_or_opts, selected)
   local session_request = {}
 
   if type(title_or_opts) == 'string' then
@@ -411,7 +515,7 @@ local create_session = Promise.async(function(connection, location, title_or_opt
   end
 
   local session_response = connection.operations
-    .create_session(connection, location, session_request, util.apply_path_map, util.apply_reverse_path_map)
+    .create_session(connection, location, session_request, util.apply_path_map, util.apply_reverse_path_map, selected)
     :catch(function(err)
       vim.notify('Error creating new session: ' .. vim.inspect(err), vim.log.levels.ERROR)
     end)
@@ -426,7 +530,8 @@ end)
 ---@return Promise<OpencodeSession|nil>
 M.create_new_session = Promise.async(function(title_or_opts)
   local connection = server_job.ensure_server():await()
-  return create_session(connection, current_location(), title_or_opts):await()
+  local selected = agent_model.resolve_session_selection():await()
+  return create_session(connection, current_location(), title_or_opts, selected):await()
 end)
 
 ---@class OpencodeDetachedSession
@@ -440,8 +545,9 @@ end)
 ---@return Promise<OpencodeDetachedSession>
 M.create_detached_session = Promise.async(function(title_or_opts)
   local connection = server_job.ensure_server():await()
+  local selected = agent_model.resolve_session_selection():await()
   local location = current_location()
-  local session = create_session(connection, location, title_or_opts):await()
+  local session = create_session(connection, location, title_or_opts, selected):await()
   if not session then
     error('Failed to create detached session')
   end
@@ -462,6 +568,171 @@ M.create_detached_session = Promise.async(function(title_or_opts)
   end
   return { session = session, connection = connection, observation = observation }
 end)
+
+---@param entry OpencodeDraftCreation
+local function release_draft_observation(entry)
+  local unsubscribe = entry.unsubscribe
+  entry.unsubscribe = nil
+  if unsubscribe then
+    unsubscribe()
+  end
+end
+
+---@param detached OpencodeDetachedSession
+local function discard_detached(detached)
+  local connection, session = detached.connection, detached.session
+  connection.operations
+    .delete_session(connection, session.id, session.location, util.apply_path_map)
+    :catch(function(err)
+      log.warn('Failed to delete abandoned draft session %s: %s', session.id, vim.inspect(err))
+    end)
+end
+
+---@param tab_id string
+---@param entry OpencodeDraftCreation
+---@param connection OpencodeServer
+local materialize_draft = Promise.async(function(tab_id, entry, connection)
+  local created, detached = pcall(function()
+    return M.create_detached_session():await()
+  end)
+  if not created then
+    log.warn('draft session creation failed: %s', tostring(detached))
+    return nil
+  end
+  ---@cast detached OpencodeDetachedSession
+  local owner = session_tabs.get(tab_id)
+  if entry.cancelled or not owner or owner.active_session or state.opencode_server ~= connection then
+    discard_detached(detached)
+    return nil
+  end
+
+  local observation = detached.observation
+  local function changed()
+    local sync = observation:read().sync.session
+    if sync.state == 'current' or sync.state == 'error' then
+      entry.ready:resolve(sync.state == 'current')
+    end
+  end
+  entry.unsubscribe = observation:watch({ 'session' }, changed)
+  changed()
+  local ready = entry.ready:await()
+  owner = session_tabs.get(tab_id)
+  if not ready or entry.cancelled or not owner or owner.active_session or state.opencode_server ~= connection then
+    discard_detached(detached)
+    return nil
+  end
+  if session_tabs.active_id() == tab_id then
+    state.session.set_active(detached.session)
+  else
+    session_tabs.set_session(owner, detached.session)
+  end
+  return detached
+end)
+
+---Explicitly materialize a draft; observation getters remain side-effect free.
+---Concurrent callers share creation and hold independent leases on its metadata subscription.
+---Returns nil on creation/metadata failure, missing draft, or cancellation (including tab close).
+---Rejects on unexpected observation/runtime failure.
+---Existing sessions are returned as-is; callers retain their operation-specific readiness checks.
+---tab_id defaults to the active tab; a supplied tab never follows tab switches.
+---@type fun(tab_id?: string): Promise<OpencodeSessionLease|nil>
+M.ensure_session = Promise.async(
+  ---@param tab_id? string
+  ---@return OpencodeSessionLease|nil
+  function(tab_id)
+    tab_id = tab_id or state.active_session_tab
+    local connection = state.opencode_server
+    if not connection or not connection:is_ready() then
+      return nil
+    end
+    local runtime = tab_id and session_tabs.get(tab_id)
+    if tab_id and not runtime then
+      return nil
+    end
+    local session = runtime and runtime.active_session or (not tab_id and state.active_session)
+    if session then
+      local observation = connection:observe(session)
+      local unsubscribe = observation:watch({ 'session' }, function() end)
+      local released = false
+      return {
+        session = session,
+        connection = connection,
+        observation = observation,
+        release = function()
+          if not released then
+            released = true
+            unsubscribe()
+          end
+        end,
+      }
+    end
+    if not runtime then
+      return nil
+    end
+    ---@cast tab_id string
+    local entry = draft_creations[tab_id]
+    if not entry then
+      ---@type OpencodeDraftCreation
+      local creation = {
+        result = Promise.new(),
+        ready = Promise.new(),
+        cancelled = false,
+        users = 0,
+        cancel = function() end,
+      }
+      entry = creation
+      creation.cancel = function()
+        creation.cancelled = true
+        creation.ready:resolve(false)
+        release_draft_observation(creation)
+      end
+      draft_creations[tab_id] = creation
+      runtime._draft_release = creation.cancel
+      materialize_draft(tab_id, creation, connection)
+        :and_then(function(detached)
+          draft_creations[tab_id] = nil
+          local owner = session_tabs.get(tab_id)
+          if owner and owner._draft_release == creation.cancel then
+            owner._draft_release = nil
+          end
+          if not detached then
+            creation.cancel()
+          end
+          creation.result:resolve(detached)
+        end)
+        :catch(function(err)
+          draft_creations[tab_id] = nil
+          local owner = session_tabs.get(tab_id)
+          if owner and owner._draft_release == creation.cancel then
+            owner._draft_release = nil
+          end
+          creation.cancel()
+          creation.result:reject(err)
+        end)
+    end
+    entry.users = entry.users + 1
+    local detached = entry.result:await()
+    if not detached then
+      return nil
+    end
+    local released = false
+    return {
+      session = detached.session,
+      observation = detached.observation,
+      connection = connection,
+      release = function()
+        if released then
+          return
+        end
+        released = true
+        entry.users = entry.users - 1
+        if entry.users == 0 then
+          release_draft_observation(entry)
+        end
+      end,
+    }
+  end
+)
 
 ---Rename a session without mutating the supplied fact or prompting for input.
 ---@param session OpencodeSession
@@ -571,16 +842,16 @@ M.fork_session = Promise.async(function(session, message_id)
 end)
 
 ---Mount an existing session in a new logical panel tab.
----@param selected_session OpencodeSession
+---@param selected_session OpencodeSession|nil Nil mounts a tab with no session; the first prompt creates one.
 ---@param directory? string Explicit tab directory; omitted preserves existing behavior.
 ---@return Promise<OpencodeSession|nil>
 M.open_session_in_tab = Promise.async(function(selected_session, directory)
-  if not selected_session or not selected_session.id then
+  if selected_session and not selected_session.id then
     return nil
   end
 
   for _, runtime in ipairs(session_tabs.list()) do
-    if runtime.active_session and runtime.active_session.id == selected_session.id then
+    if selected_session and runtime.active_session and runtime.active_session.id == selected_session.id then
       if directory then
         runtime.bound_directory = directory
         runtime.bound_editor_cwd = vim.fn.getcwd()
@@ -615,6 +886,7 @@ M.open_session_in_tab = Promise.async(function(selected_session, directory)
     focus = 'input',
     start_insert = true,
     new_session = false,
+    draft = selected_session == nil,
     open_action = 'create_fresh',
   }):await()
 
@@ -704,11 +976,14 @@ M.open_session_in_tab_by_id = Promise.async(function(session_id)
 end)
 
 ---Open a new session in a logical tab inside the Opencode panel.
----@param title? string
+---@param title? string Named tabs create the session up front; untitled ones stay empty until the first prompt.
 ---@return Promise<OpencodeSession|nil>
 M.open_session_tab = Promise.async(function(title)
   local runtime = session_tabs.current()
   local directory = runtime and runtime.bound_directory
+  if not title then
+    return M.open_session_in_tab(nil, directory):await()
+  end
   local new_session = M.create_new_session(title):await()
   if not new_session then
     return nil
@@ -746,6 +1021,7 @@ M.switch_session_tab = Promise.async(function(tab_id)
     focus = focus,
     new_session = false,
     open_action = 'restore_hidden',
+    draft = runtime.active_session == nil,
   }):await()
 
   return runtime.active_session
@@ -1027,6 +1303,8 @@ end)
 
 ---@param cwd? string Directory from DirChanged; defaults to Neovim cwd.
 M.handle_directory_change = Promise.async(function(cwd)
+  directory_change_generation = directory_change_generation + 1
+  local request = directory_change_generation
   cwd = cwd or vim.fn.getcwd()
   local locked = M.is_session_locked(cwd)
   log.debug('Working directory change %s', vim.inspect({ cwd = cwd, locked = locked }))
@@ -1042,6 +1320,39 @@ M.handle_directory_change = Promise.async(function(cwd)
       'Session locked, staying on [' .. state.active_session.id .. '] in new working dir [' .. cwd .. ']',
       vim.log.levels.INFO
     )
+    return
+  end
+
+  if config.ui.restore_tabs_on_startup then
+    local visible = state.ui.is_visible() or group_panel_visible
+    local previous = session_tabs.current()
+    local restoring = tab_persistence.restore(false, prepare_group_switch, cwd)
+    if restoring then
+      restoring:await()
+    end
+    -- A newer DirChanged owns the panel after an asynchronous lookup.
+    if request ~= directory_change_generation or vim.fs.normalize(vim.fn.getcwd()) ~= vim.fs.normalize(cwd) then
+      return
+    end
+    local current = session_tabs.current()
+    if current ~= previous or group_panel_visible then
+      context.restore(session_tabs.get_context())
+      if visible then
+        M.open({ focus = 'input', new_session = false, open_action = 'restore_hidden' }):await()
+        if state.active_session then
+          ui.render_output()
+        end
+      end
+      group_panel_visible = false
+    end
+    for _, tab in ipairs(session_tabs.list()) do
+      if tab.bound_directory then
+        tab.bound_editor_cwd = cwd
+      end
+    end
+    if current and not current.bound_directory then
+      state.context.set_current_cwd(current.current_cwd or cwd)
+    end
     return
   end
 

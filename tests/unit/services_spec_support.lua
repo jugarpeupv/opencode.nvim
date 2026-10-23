@@ -22,6 +22,9 @@ function M.mock_connection()
       time = { updated = 2 },
     })
   end
+  connection.operations.delete_session = function()
+    return Promise.new():resolve(true)
+  end
   connection.operations.list_sessions_project = function()
     return Promise.new():resolve({ { id = 'test-session', title = 'test-session', time = { updated = 2 } } })
   end
@@ -73,6 +76,14 @@ function M.mock_connection()
       return require('opencode.protocols.v1.observation').prepare_message(opts, selected)
     end
     observation._connection = self
+    -- Specs flip connection.protocol after observing, so the flag follows it.
+    setmetatable(observation, {
+      __index = function(current, key)
+        if key == 'needs_message_defaults' then
+          return current._connection.protocol == 'v1'
+        end
+      end,
+    })
     function observation:read()
       return self._state
     end

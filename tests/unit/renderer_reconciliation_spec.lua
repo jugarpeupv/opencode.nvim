@@ -7,6 +7,7 @@ local state = require('opencode.state')
 local config = require('opencode.config')
 local stub = require('luassert.stub')
 local spy = require('luassert.spy')
+local optimistic = require('opencode.state.optimistic')
 
 describe('renderer incremental reconciliation', function()
   local observed, observation, changed, controllers, writes, markdown, dirty_part, dirty_message, max_messages, throttle_ms, collapsing, defer_stub, files_stub
@@ -116,6 +117,113 @@ describe('renderer incremental reconciliation', function()
     if state.windows then
       require('opencode.ui.ui').close_windows(state.windows)
     end
+  end)
+
+  it('replaces a running background spinner with its outcome and appends a completion notice', function()
+    writes:revert()
+    writes = spy.on(output_window, 'set_lines')
+    local normalize = require('opencode.protocols.v2.normalize')
+    local output_spinner = require('opencode.ui.output_spinner')
+    local tool = normalize.mapped_message(observed.session.id, {
+      id = 'msg_bg',
+      type = 'assistant',
+      agent = 'build',
+      time = { created = 1 },
+      content = {
+        {
+          id = 'call_bg',
+          type = 'tool',
+          name = 'shell',
+          time = { created = 1, completed = 2 },
+          state = {
+            status = 'completed',
+            input = { command = 'make check', background = true },
+            metadata = { shellID = 'sh_1', status = 'running' },
+            content = {},
+          },
+        },
+      },
+    })
+    observed.entries_by_id.msg_bg = tool
+    observed.entry_order[#observed.entry_order + 1] = tool.id
+    notify('messages')
+    local buf = state.windows.output_buf
+    assert.equals(1, #vim.api.nvim_buf_get_extmarks(buf, output_spinner.namespace, 0, -1, {}))
+
+    local note = normalize.mapped_message(observed.session.id, {
+      id = 'msg_done',
+      type = 'synthetic',
+      time = { created = 3 },
+      metadata = { source = 'shell', shellID = 'sh_1', state = 'completed', exit = 0 },
+      text = '<shell id="sh_1" state="completed" command="make check">\nok\n</shell>',
+    })
+    observed.entries_by_id.msg_done = note
+    observed.entry_order[#observed.entry_order + 1] = note.id
+    notify('messages')
+    assert.equals(0, #vim.api.nvim_buf_get_extmarks(buf, output_spinner.namespace, 0, -1, {}))
+    local text = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), '\n')
+    assert.is_truthy(text:find('↳ Shell finished · make check', 1, true))
+    local found = false
+    for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(buf, output_window.namespace, 0, -1, { details = true })) do
+      for _, chunk in ipairs(mark[4].virt_text or {}) do
+        found = found or chunk[1]:find('Background · done', 1, true) ~= nil
+      end
+    end
+    assert.is_true(found)
+
+    tool.content[1].input.command = 'make test'
+    notify('messages')
+    text = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), '\n')
+    assert.is_truthy(text:find('↳ Shell finished · make test', 1, true))
+    assert.is_nil(text:find('↳ Shell finished · make check', 1, true))
+  end)
+
+  it('keeps an echoed prompt suppressed after observed history is replaced', function()
+    writes:revert()
+    writes = spy.on(output_window, 'set_lines')
+    local pending = optimistic.begin(observation, 'instant optimistic text')
+    renderer.on_optimistic_changed()
+    local function output()
+      return table.concat(vim.api.nvim_buf_get_lines(state.windows.output_buf, 0, -1, false), '\n')
+    end
+    assert.is_true(vim.wait(1000, function()
+      return output():find('instant optimistic text', 1, true) ~= nil
+    end))
+    local local_message = contexts.current().render_state:get_message(pending.id)
+    assert.same({}, local_message.actions)
+    optimistic.bind(pending, 'msg_echo')
+    observed.entries_by_id.msg_echo = {
+      id = 'msg_echo',
+      session_id = observed.session.id,
+      kind = 'user',
+      content = { { id = 'echo_text', kind = 'text', text = 'instant optimistic text' } },
+    }
+    observed.entry_order[#observed.entry_order + 1] = 'msg_echo'
+    notify('messages')
+    assert.is_nil(contexts.current().render_state:get_message(pending.id))
+    assert.is_not_nil(contexts.current().render_state:get_message('msg_echo'))
+    local _, count = output():gsub('instant optimistic text', '')
+    assert.equals(1, count)
+
+    observed.entries_by_id.msg_echo = nil
+    observed.entry_order = { 'msg_one', 'msg_two' }
+    notify('messages')
+    assert.is_nil(contexts.current().render_state:get_message(pending.id))
+    assert.is_nil(contexts.current().render_state:get_message('msg_echo'))
+    local _, resurfaced = output():gsub('instant optimistic text', '')
+    assert.equals(0, resurfaced)
+
+    optimistic.finish(observation, pending)
+  end)
+
+  it('keeps a newly submitted prompt visible while the server still reports an undo boundary', function()
+    observed.session.revert = { messageID = 'msg_two' }
+    notify('session')
+    local pending = optimistic.begin(observation, 'new after undo')
+    renderer.on_optimistic_changed()
+    assert.is_not_nil(contexts.current().render_state:get_message(pending.id))
+    assert.is_nil(contexts.current().render_state:get_message('msg_two'))
+    optimistic.finish(observation, pending)
   end)
 
   it('writes the initial observed history once and preserves all rendered ranges', function()

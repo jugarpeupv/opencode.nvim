@@ -22,8 +22,8 @@ local function rebuild_content_index(observation, entry)
     if ordinals[content.kind] then
       index[content_key(content.kind, ordinals[content.kind])] = content
       ordinals[content.kind] = ordinals[content.kind] + 1
-    elseif content.kind == 'tool' and content.id then
-      index['tool:' .. content.id] = content
+    elseif content.kind == 'tool' and content.call_id then
+      index['tool:' .. content.call_id] = content
     end
   end
   observation._v2_content_by_message[entry.id] = index
@@ -139,7 +139,7 @@ local function ordinal_content(observation, data, event_type, create)
   if content or not create then
     return content
   end
-  content = { kind = kind, text = '' }
+  content = { id = normalize.synthetic_id(entry.id, kind, data.ordinal), kind = kind, text = '' }
   entry.content[#entry.content + 1] = content
   index[key] = content
   return content
@@ -170,7 +170,13 @@ local function tool_content(observation, data, event_type, create)
     invalid(observation, event_type, 'is missing tool name')
     return nil
   end
-  content = { id = data.id, kind = 'tool', call_id = data.id, name = data.name, state = 'streaming' }
+  content = {
+    id = normalize.synthetic_id(entry.id, 'tool', data.id),
+    kind = 'tool',
+    call_id = data.id,
+    name = data.name,
+    state = 'streaming',
+  }
   entry.content[#entry.content + 1] = content
   index['tool:' .. data.id] = content
   return content
@@ -179,18 +185,33 @@ end
 ---@type table<string, fun(observation: OpencodeV2Observation, event: OpencodeV2Event, data: table): boolean>
 local handlers = {}
 
+---Signals that the cached page is out of date and must be refetched.
+---@return 'refetch'
+local function invalidate_messages()
+  return 'refetch'
+end
+
 ---@param observation OpencodeV2Observation
 ---@param event OpencodeV2Event
 ---@param data table
 handlers['session.inbox.enqueued'] = function(observation, event, data)
-  if type(data.inboxID) ~= 'string' or type(data.item) ~= 'table' or data.item.type ~= 'user' then
+  if type(data.inboxID) ~= 'string' or type(data.item) ~= 'table' then
+    return false
+  end
+  local kind = data.item.type
+  if kind ~= 'user' and kind ~= 'synthetic' then
     return false
   end
   if type(data.item.payload) ~= 'table' then
-    return invalid(observation, event.type, 'is missing user payload')
+    return invalid(observation, event.type, 'is missing ' .. kind .. ' payload')
+  end
+  -- A busy session steers background completions through the inbox instead of
+  -- emitting session.synthetic; the inbox id becomes the persisted message id.
+  if kind == 'synthetic' and not normalize.is_background_notification(data.item.payload.metadata) then
+    return false
   end
   local info = vim.deepcopy(data.item.payload)
-  info.id, info.type, info.time = data.inboxID, 'user', { created = event.created }
+  info.id, info.type, info.time = data.inboxID, kind, { created = event.created }
   local ok, entry = pcall(normalize.mapped_message, observation._session_id, info)
   if not ok then
     return boundary.diagnostic(observation, 'messages', tostring(entry))
@@ -198,6 +219,75 @@ handlers['session.inbox.enqueued'] = function(observation, event, data)
   ---@cast entry table
   put_entry(observation, entry)
   return true
+end
+
+---Server-side notices (restart, instruction changes) are projected into messages
+---by the backend, but the message snapshot can predate their arrival and the
+---snapshot itself is not re-pulled on ordinary traffic, so without these handlers
+---the notices never reach the observation. Mirrors the TUI's projection in
+---message-updater.ts.
+local function put_notice(observation, event, info)
+  local ok, entry = pcall(normalize.mapped_message, observation._session_id, info)
+  if not ok then
+    return boundary.diagnostic(observation, 'messages', tostring(entry))
+  end
+  ---@cast entry table
+  put_entry(observation, entry)
+  return true
+end
+
+local function notice_message_id(event)
+  -- SessionMessage.ID.fromEvent: the message id is the durable event id with the
+  -- evt_ prefix swapped, so the projected entry merges with the snapshot copy.
+  return (event.id:gsub('^evt_', 'msg_'))
+end
+
+---@param observation OpencodeV2Observation
+---@param event OpencodeV2Event
+---@param data table
+handlers['session.synthetic'] = function(observation, event, data)
+  local metadata = data.metadata
+  -- Background completions carry no message id, so the snapshot is the only
+  -- source of the entry that records their outcome.
+  if normalize.is_background_notification(metadata) then
+    return invalidate_messages()
+  end
+  -- Only server-authored notices carry a description; plain synthetic parts are
+  -- already in the message snapshot, so projecting them again would duplicate.
+  if type(data.description) ~= 'string' or data.description == '' then
+    return false
+  end
+  if type(data.text) ~= 'string' then
+    return invalid(observation, event.type, 'is missing text')
+  end
+  return put_notice(observation, event, {
+    id = notice_message_id(event),
+    type = 'synthetic',
+    text = data.text,
+    description = data.description,
+    time = { created = event.created },
+  })
+end
+
+---@param observation OpencodeV2Observation
+---@param event OpencodeV2Event
+---@param data table
+handlers['session.instructions.updated'] = function(observation, event, data)
+  if data.text == nil then
+    return false
+  end
+  if type(data.text) ~= 'string' or type(data.delta) ~= 'table' then
+    return invalid(observation, event.type, 'has invalid text/delta')
+  end
+  local keys = vim.tbl_keys(data.delta)
+  table.sort(keys)
+  return put_notice(observation, event, {
+    id = notice_message_id(event),
+    type = 'system',
+    text = data.text,
+    description = 'Instructions updated: ' .. table.concat(keys, ', '),
+    time = { created = event.created },
+  })
 end
 
 ---@param observation OpencodeV2Observation
@@ -383,15 +473,27 @@ end
 handlers['session.tool.success'] = finish_tool
 handlers['session.tool.failed'] = finish_tool
 
+handlers['session.revert.committed'] = invalidate_messages
+handlers['session.compaction.ended'] = invalidate_messages
+
 ---@param observation OpencodeV2Observation
 ---@param event OpencodeV2Event
 ---@return boolean changed
 function M.ingest_event(observation, event)
   local handler = handlers[event.type]
-  if not handler or event.data.sessionID ~= observation._session_id then
+  if not handler then
     return false
   end
-  if not handler(observation, event, event.data) then
+  if event.data.sessionID ~= observation._session_id then
+    return false
+  end
+  local result = handler(observation, event, event.data)
+  if result == 'refetch' then
+    observation:read().sync.messages = { state = 'stale' }
+    observation:_start_resource('messages')
+    return true
+  end
+  if not result then
     return false
   end
   observation:read().sync.messages = { state = 'current' }
@@ -480,6 +582,12 @@ function M.attach_history(observation, connection)
       end
     end)()
   end
+end
+
+---Session event types the message resource handles.
+---@return table<string, fun(observation: OpencodeV2Observation, event: OpencodeV2Event, data: table): boolean>
+function M.handler_types()
+  return handlers
 end
 
 ---@param observation OpencodeV2Observation

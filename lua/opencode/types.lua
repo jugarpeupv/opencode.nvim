@@ -10,6 +10,11 @@
 ---@field code? string|number
 ---@field user_data? any
 
+---@class OpencodeSessionSelection
+---@field mode? string
+---@field model? string
+---@field variant? string
+
 ---@class OpencodeConfigFile
 ---@field theme string
 ---@field autoshare boolean
@@ -259,6 +264,7 @@
 ---@field input_position 'bottom'|'top' # Position of the input window (default: 'bottom')
 ---@field window_width number
 ---@field persist_state boolean
+---@field restore_tabs_on_startup boolean # Keep project-scoped panel tab groups and restore them across Neovim restarts
 ---@field zoom_width number
 ---@field float OpencodeUIFloatConfig
 ---@field picker_width number|false|nil # Width for pickers. 0<w<=1 = fraction of screen; >1 = absolute columns; false = use picker backend defaults.
@@ -320,6 +326,7 @@
 ---@field use_folds boolean
 ---@field fold_exclude (string|{server: string, tool: string})[]|nil
 ---@field folding_threshold number
+---@field streaming_preview_lines integer -- Trailing content lines visible in streaming folds; 0 disables
 
 ---@class OpencodeUIOutputConfig
 ---@field time_format string|nil # Custom os.date format for timestamps, e.g. '%m/%d %H:%M'. Uses fixed default when nil.
@@ -373,7 +380,7 @@
 ---@class OpencodeCommandHookRegisterOptions
 ---@field command? OpencodeCommandHookScope
 
----@alias OpencodeBarSegment { [1]: string, [2]?: string, align?: 'left'|'right' }
+---@alias OpencodeBarSegment { [1]: string, [2]?: string, align?: 'left'|'right', spinner?: boolean }
 ---@alias OpencodeBarSegmentsHook fun(segments: OpencodeBarSegment[]): OpencodeBarSegment[]|nil
 ---@class OpencodeHooks
 ---@field on_topbar_render? OpencodeBarSegmentsHook
@@ -446,6 +453,7 @@
 ---@field keymap_prefix string
 ---@field opencode_executable 'opencode' | string -- Command run for calling opencode
 ---@field lock_session_to_directory boolean|fun(change: OpencodeDirectoryChange): boolean -- true locks everywhere; a function decides per directory change; errors fall back to following cwd
+---@field program_status {enabled: boolean, tmux: boolean} -- OSC 7501 reporting; tmux enables DCS passthrough
 ---@field server OpencodeServerConfig -- Custom/external server configuration
 ---@field keymap OpencodeKeymap
 ---@field ui OpencodeUIConfig
@@ -498,7 +506,7 @@
 ---@field path string
 ---@field line? integer
 ---@field col? integer
----@field source_kind 'assistant_text'|'tool_file_path'
+---@field source_kind 'assistant_text'|'tool_file_path'|'user_file_part'|'editor_context_selection'
 ---@field raw_range? CodeReferenceTextRange Required for assistant_text references
 ---@field order integer Smaller values appear earlier in the session message/part/text order.
 
@@ -509,6 +517,8 @@
 ---@field interactive boolean
 ---@field resolve_symbol_targets? boolean
 ---@field get_child_parts? fun(session_id: string): table[]?
+---@field get_background_result? fun(id: string): OpencodeV2BackgroundResult?
+---@field get_background_tool? fun(id: string): table?
 ---@field current_refs? CodeReference[]
 ---@field current_files? string[]
 ---@field symbol_cycle? SymbolSnapshotCycle
@@ -531,7 +541,7 @@
 ---@field part_id string
 ---@field message_id string
 
----@alias OutputExtmarkType vim.api.keyset.set_extmark & {start_col:0}
+---@alias OutputExtmarkType vim.api.keyset.set_extmark & {start_col:0, spinner_chunk?: integer}
 ---@alias OutputExtmark OutputExtmarkType|fun():OutputExtmarkType
 
 ---@class RestorePoint
@@ -549,6 +559,7 @@
 ---@field focus? 'input' | 'output'
 ---@field start_insert? boolean
 ---@field new_session? boolean
+---@field draft? boolean Open without resuming a session; the tab stays empty until the first prompt
 ---@field open_action? 'reuse_visible'|'restore_hidden'|'create_fresh'
 
 ---@class SendMessageOpts

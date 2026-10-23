@@ -20,6 +20,7 @@ local function message_snapshot(entry, previous)
     kind = entry.kind,
     agent = entry.agent,
     queued = entry.queued,
+    local_status = entry.local_status,
     model = entry.model,
     created = entry.time and entry.time.created,
     error = entry.error,
@@ -76,6 +77,12 @@ function M.reconcile(visible, references_changed, ctx)
           error = entry.error,
           content_kinds = entry.kind == 'user' and ctx.message_snapshots[entry.id].content_kinds or nil,
           last = last_part_id == part_id,
+          -- A background job's outcome arrives as a separate entry but renders in its tool part.
+          background_result = content.background and ctx.background_results[content.background.id],
+          completion = entry.background_result,
+          completion_input = entry.background_result
+            and ctx.background_tools[entry.background_result.id]
+            and ctx.background_tools[entry.background_result.id].input,
         })
         if changed or (references_changed and content.kind == 'text') or not rendered or rendered.line_start == nil then
           flush.mark_part_dirty(part_id, entry.id, ctx)

@@ -21,6 +21,7 @@ local support = require('tests.unit.services_spec_support')
 
 describe('opencode.services.session_runtime', function()
   local original
+  local original_restore_tabs_on_startup
 
   local function set_session_fact(session_id, parent_id)
     local connection = state.opencode_server
@@ -30,6 +31,12 @@ describe('opencode.services.session_runtime', function()
 
   before_each(function()
     original = support.snapshot_state()
+    -- Tabs are not part of the snapshot; leftovers from earlier specs would
+    -- otherwise be bound to the sessions these tests activate.
+    state.session_tabs.reset()
+    -- Keep open() away from snapshots in the real stdpath('state').
+    original_restore_tabs_on_startup = config.ui.restore_tabs_on_startup
+    config.ui.restore_tabs_on_startup = false
 
     vim.fn.executable = function(_)
       return 1
@@ -62,6 +69,7 @@ describe('opencode.services.session_runtime', function()
 
   after_each(function()
     support.restore_state(original)
+    config.ui.restore_tabs_on_startup = original_restore_tabs_on_startup
 
     for _, fn in ipairs({
       'create_windows',
@@ -120,7 +128,105 @@ describe('opencode.services.session_runtime', function()
     end)
   end)
 
+  describe('create_new_session defaults', function()
+    for _, explicit in ipairs({ false, true }) do
+      it('passes neutral selections at creation, explicit options: ' .. tostring(explicit), function()
+        local connection = state.opencode_server
+        connection.protocol = 'v2'
+        state.model.clear()
+        state.model.set_mode_model_map({})
+        local previous_mode = config.default_mode
+        config.default_mode = 'orchestrator'
+        local agents = stub(config_file, 'get_opencode_agents').returns(Promise.new():resolve({ 'orchestrator' }))
+        local defaults = stub(config_file, 'get_opencode_config').returns(Promise.new():resolve({
+          model = 'opencode/gemini-4-argon',
+          agent = { orchestrator = { model = 'opencode-go/glm-5.3-flash' } },
+        }))
+        local request, selection
+        connection.operations.create_session = function(_, _, input, _, _, selected)
+          request = input
+          selection = selected
+          return Promise.new():resolve({
+            id = 'new-session',
+            model = input.model or { providerID = 'opencode-go', id = 'glm-5.3-flash' },
+          })
+        end
+        local input = explicit
+            and {
+              title = 'Explicit',
+              agent = 'other',
+              model = { providerID = 'custom', id = 'chosen', variant = 'high' },
+            }
+          or 'Default'
+        local ok, err = pcall(function()
+          local session = session_runtime.create_new_session(input):wait()
+          assert.same(explicit and input or { title = 'Default' }, request)
+          assert.same({ mode = 'orchestrator', model = 'opencode-go/glm-5.3-flash' }, selection)
+          state.session.set_active(session)
+          connection.operations.get_session = function()
+            return Promise.new():resolve(session)
+          end
+          agent_model.sync_from_server():wait()
+          assert.equals(explicit and 'custom/chosen' or 'opencode-go/glm-5.3-flash', state.current_model)
+        end)
+        config.default_mode = previous_mode
+        agents:revert()
+        defaults:revert()
+        assert.is_true(ok, tostring(err))
+      end)
+    end
+
+    it('keeps V1 creation requests unchanged', function()
+      local request
+      state.opencode_server.operations.create_session = function(_, _, input)
+        request = input
+        return Promise.new():resolve({ id = 'v1-session' })
+      end
+      assert.equals('v1-session', session_runtime.create_new_session('Legacy'):wait().id)
+      assert.same({ title = 'Legacy' }, request)
+    end)
+  end)
+
   describe('open', function()
+    it('restores persisted tabs before mounting windows', function()
+      local persistence = require('opencode.services.session_tab_persistence')
+      local order = {}
+      local restore = stub(persistence, 'restore').invokes(function(background)
+        assert.is_false(background)
+        table.insert(order, 'restore')
+        return Promise.new():resolve(nil)
+      end)
+      local prepare = stub(ui, 'prepare_windows').invokes(function()
+        table.insert(order, 'windows')
+        return false
+      end)
+      local ok, err = pcall(function()
+        session_runtime.open({ new_session = false }):wait()
+        assert.same({ 'restore', 'windows' }, order)
+      end)
+      restore:revert()
+      prepare:revert()
+      assert.is_true(ok, tostring(err))
+    end)
+
+    it('mounts windows before server startup when there is nothing to restore', function()
+      local server_job = require('opencode.server_job')
+      local connection = state.opencode_server
+      local starting = Promise.new()
+      local ensure = stub(server_job, 'ensure_server').returns(starting)
+      local prepare = stub(ui, 'prepare_windows').returns(false)
+      local opening = session_runtime.open({ new_session = false })
+      local mounted = #prepare.calls
+      starting:resolve(connection)
+      local ok, err = pcall(function()
+        opening:wait()
+      end)
+      ensure:revert()
+      prepare:revert()
+      assert.equals(1, mounted)
+      assert.is_true(ok, tostring(err))
+    end)
+
     it("creates windows if they don't exist", function()
       state.ui.set_windows(nil)
       session_runtime.open({ new_session = false, focus = 'input' }):wait()
@@ -229,11 +335,112 @@ describe('opencode.services.session_runtime', function()
       vim.fn.getcwd = original_getcwd
     end)
 
-    it('handles new session properly', function()
+    it('leaves the new-session tab empty until the first prompt', function()
       state.ui.set_windows(nil)
       state.session.set_active({ id = 'old-session' })
       session_runtime.open({ new_session = true, focus = 'input' }):wait()
-      assert.truthy(state.active_session)
+      assert.is_nil(state.active_session)
+    end)
+
+    it('leaves a new session tab empty instead of resuming the last session', function()
+      state.ui.set_windows(nil)
+      state.session.set_active({ id = 'old-session' })
+      state.opencode_server.operations.list_sessions_project = function()
+        return Promise.new():resolve({
+          { id = 'recent-session', title = 'recent', time = { updated = 5 } },
+        })
+      end
+      local create = stub(session_runtime, 'create_new_session').returns(Promise.new():resolve({ id = 'eager' }))
+
+      session_runtime.open_session_tab():wait()
+
+      assert.stub(create).was_not_called()
+      assert.is_nil(state.active_session)
+      create:revert()
+    end)
+
+    it('still resumes the most recent session on first open without an existing tab', function()
+      state.session_tabs.reset()
+      state.session.set_active(nil)
+      state.context.set_current_cwd(vim.fn.getcwd())
+      state.opencode_server.operations.list_sessions_project = function()
+        return Promise.new():resolve({ { id = 'recent-session', title = 'recent', time = { updated = 5 } } })
+      end
+
+      session_runtime.open({ new_session = false, focus = 'input' }):wait()
+
+      assert.equals('recent-session', state.active_session.id)
+    end)
+
+    for _, focus in ipairs({ 'input', 'output' }) do
+      it('preserves an existing draft when reopening ' .. focus .. ' beside a real session', function()
+        local tabs = state.session_tabs
+        state.context.set_current_cwd(vim.fn.getcwd())
+        state.session.set_active({ id = 'real-session' })
+        local first = tabs.ensure_current()
+        local draft = tabs.create(nil)
+        tabs.activate(draft)
+        state.ui.set_input_content({ 'unfinished draft' })
+        local list = stub(state.opencode_server.operations, 'list_sessions_project').returns(Promise.new():resolve({
+          { id = 'real-session', title = 'real', time = { updated = 5 } },
+        }))
+        local create = stub(session_runtime, 'create_detached_session')
+
+        session_runtime.open({ new_session = false, focus = focus }):wait()
+
+        assert.equals(draft.id, tabs.active_id())
+        assert.is_nil(state.active_session)
+        assert.is_nil(draft.active_session)
+        assert.equals('real-session', first.active_session.id)
+        assert.same({ 'unfinished draft' }, state.input_content)
+        assert.stub(list).was_not_called()
+        assert.stub(create).was_not_called()
+        list:revert()
+        create:revert()
+      end)
+    end
+
+    it('keeps attached selection context in its draft when opening input', function()
+      local context = require('opencode.context')
+      local tabs = state.session_tabs
+      local original_context = context.snapshot()
+      state.context.set_current_cwd(vim.fn.getcwd())
+      state.session.set_active({ id = 'real-session' })
+      context.clear_selections()
+      local first = tabs.ensure_current()
+      tabs.set_context(context.snapshot())
+      local draft = tabs.create(nil)
+      tabs.activate(draft)
+      state.ui.set_input_content({ 'unfinished draft' })
+      state.opencode_server.operations.list_sessions_project = function()
+        return Promise.new():resolve({ { id = 'real-session', title = 'real', time = { updated = 5 } } })
+      end
+      local selection = {
+        content = 'local gate = Promise.new()',
+        lines = '580, 580',
+        file = { path = '/tmp/session_runtime.lua', name = 'session_runtime.lua', extension = 'lua' },
+      }
+      local add = stub(context, 'add_visual_selection').invokes(function()
+        context.add_selection(selection)
+        return true
+      end)
+      local create = stub(session_runtime, 'create_detached_session')
+
+      require('opencode.commands.handlers.workflow').actions
+        .add_visual_selection({}, { start = 580, stop = 580 })
+        :wait()
+
+      assert.equals(draft.id, tabs.active_id())
+      assert.is_nil(state.active_session)
+      assert.same({ selection }, context.get_context().selections)
+      assert.same({ selection }, draft.context_data.selections)
+      assert.same({}, first.context_data.selections)
+      assert.same({ 'unfinished draft' }, state.input_content)
+      assert.equals('real-session', first.active_session.id)
+      assert.stub(create).was_not_called()
+      add:revert()
+      create:revert()
+      context.restore(original_context)
     end)
 
     it('clears old attachments before loading editor context for a new session', function()
@@ -284,7 +491,7 @@ describe('opencode.services.session_runtime', function()
       assert.is_true(output_focused)
     end)
 
-    it('creates a new session when no active session and no last session exists', function()
+    it('leaves the tab empty when no active session and no last session exists', function()
       state.ui.set_windows(nil)
       state.session.set_active(nil)
       state.opencode_server.operations.list_sessions_project = function()
@@ -293,17 +500,16 @@ describe('opencode.services.session_runtime', function()
 
       session_runtime.open({ new_session = false, focus = 'input' }):wait()
 
-      assert.truthy(state.active_session)
-      assert.truthy(state.active_session.id)
+      assert.is_nil(state.active_session)
     end)
 
     it('resets is_opening flag when error occurs', function()
       state.ui.set_windows(nil)
       store.set('is_opening', false)
 
-      local original_create_new_session = session_runtime.create_new_session
-      session_runtime.create_new_session = function()
-        error('Test error in create_new_session')
+      local original_ensure_current_mode = agent_model.ensure_current_mode
+      agent_model.ensure_current_mode = function()
+        error('Test error in ensure_current_mode')
       end
 
       local notify_stub = stub(vim, 'notify')
@@ -318,7 +524,7 @@ describe('opencode.services.session_runtime', function()
       assert.is_false(state.is_opening)
       assert.stub(notify_stub).was_called()
 
-      session_runtime.create_new_session = original_create_new_session
+      agent_model.ensure_current_mode = original_ensure_current_mode
       notify_stub:revert()
     end)
   end)
@@ -376,13 +582,44 @@ describe('opencode.services.session_runtime', function()
 
   describe('detached session creation', function()
     local ensure_server
+    local resolve_selection
     local server_job = require('opencode.server_job')
+
+    before_each(function()
+      resolve_selection = stub(agent_model, 'resolve_session_selection').returns(
+        Promise.new():resolve({ mode = 'custom-agent', model = 'provider/model' })
+      )
+    end)
 
     after_each(function()
       if ensure_server then
         ensure_server:revert()
         ensure_server = nil
       end
+      if resolve_selection then
+        resolve_selection:revert()
+        resolve_selection = nil
+      end
+    end)
+
+    it('creates the session with the resolved agent selection', function()
+      local received
+      local connection = {
+        operations = {
+          create_session = function(_, _, _, _, _, selected)
+            received = selected
+            return Promise.new():resolve({ id = 'detached-id' })
+          end,
+        },
+        observe = function()
+          return {}
+        end,
+      }
+      ensure_server = stub(server_job, 'ensure_server').returns(Promise.new():resolve(connection))
+
+      session_runtime.create_detached_session():wait()
+
+      assert.same({ mode = 'custom-agent', model = 'provider/model' }, received)
     end)
 
     for _, case in ipairs({

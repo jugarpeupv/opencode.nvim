@@ -2,6 +2,7 @@ local state = require('opencode.state')
 local config = require('opencode.config')
 local window_options = require('opencode.ui.window_options')
 local float_layout = require('opencode.ui.float_layout')
+local output_spinner = require('opencode.ui.output_spinner')
 
 ---@class OutputWindowWithWin: OpencodeWindowState
 ---@field output_win integer
@@ -15,6 +16,7 @@ local M = {}
 M.namespace = vim.api.nvim_create_namespace('opencode_output')
 M.debug_namespace = vim.api.nvim_create_namespace('opencode_output_debug')
 M.markdown_namespace = vim.api.nvim_create_namespace('opencode_output_markdown')
+M.fold_namespace = vim.api.nvim_create_namespace('opencode_output_folds')
 M._last_visible_bottom_by_win = {}
 M._was_at_bottom_by_win = {}
 M._prev_line_count_by_win = {}
@@ -214,6 +216,8 @@ function M.on_user_navigation(win)
   local previous_cursor = M._last_cursor_by_win[win]
   M._last_cursor_by_win[win] = cursor
   local bottom_text = vim.api.nvim_buf_get_lines(windows.output_buf, effective_bottom - 1, effective_bottom, false)[1] --[[@as string]]
+  -- Avoid Blob conversion at the Vimscript boundary without shifting byte offsets.
+  bottom_text = bottom_text:gsub('%z', '\n')
   local cursor_at_end = cursor_line >= effective_bottom and cursor[2] >= math.max(0, vim.fn.match(bottom_text, '.$'))
   local moved_toward_end = (previous_cursor and (cursor_line > previous_cursor[1] or cursor[2] > previous_cursor[2]))
     or (top and previous_top and top > previous_top)
@@ -316,12 +320,14 @@ end
 ---@param topline integer
 function M.restore_view_topline(win, topline)
   vim.api.nvim_win_call(win, function()
+    local cursor = vim.api.nvim_win_get_cursor(0)
     local view = vim.fn.winsaveview()
     view.topline = math.max(1, topline)
     view.skipcol = 0
     vim.fn.winrestview(view)
-    -- Apply the restored viewport before later line('w$') reads inspect it.
-    vim.cmd('redraw')
+    -- Reapplying cursor through the API resolves wrapped-line skipcol without
+    -- synchronously redrawing while Tree-sitter may still hold stale ranges.
+    vim.api.nvim_win_set_cursor(0, cursor)
   end)
 end
 
@@ -461,49 +467,86 @@ function M.update_dimensions(windows)
   pcall(vim.api.nvim_win_set_width, output_win, width)
 end
 
----Fold text for the output buffer
+---@param line_count integer
+---@param width integer
+---@return string
+local function fold_summary(line_count, width)
+  local text = string.format('▶ %d lines hidden (zo open, zc close) ◀', line_count)
+  local remaining = math.max(0, width - vim.fn.strdisplaywidth(text))
+  local padding = math.floor(remaining / 2)
+  return string.rep('-', padding) .. text .. string.rep('-', remaining - padding)
+end
+
+---Native fold bounds remain authoritative while cached ranges are being shifted.
 ---@return string
 function M.fold_text()
-  local windows = state.windows
-  local output_buf = windows and windows.output_buf
-  local line = vim.v.foldstart
-
-  if not output_buf or not vim.api.nvim_buf_is_valid(output_buf) then
-    return vim.fn.foldtext()
-  end
-
-  local folds = state.ui.get_output_folds().ranges
-
-  local line_count = 0
-  for _, range in ipairs(folds) do
-    if line >= range.from and line <= range.to then
-      line_count = range.to - range.from + 1
-      break
-    end
-  end
-
-  if line_count > 0 then
-    local text = string.format('▶ %d lines hidden (zo open, zc close) ◀', line_count)
-    local width = vim.api.nvim_win_get_width(0)
-    local padding = math.max(0, math.floor((width - #text) / 2))
-    return string.rep('-', padding) .. text .. string.rep('-', padding)
-  end
-  return vim.fn.foldtext()
+  return fold_summary(vim.v.foldend - vim.v.foldstart + 1, vim.api.nvim_win_get_width(0))
 end
 
 _G.opencode_fold_text = M.fold_text
 
-function M.get_open_fold_starts(win, buf)
+---@type table<integer, string>
+local visible_fold_summaries = {}
+vim.api.nvim_set_decoration_provider(M.fold_namespace, {
+  on_win = function(_, win, buf, top, bottom)
+    local windows = state.windows
+    if not windows or win ~= windows.output_win or buf ~= windows.output_buf then
+      return false
+    end
+    local info = vim.fn.getwininfo(win)[1] --[[@as {textoff: integer}]]
+    local width = vim.api.nvim_win_get_width(win) - info.textoff
+    visible_fold_summaries = {}
+    -- Query the target window once; provider callbacks need not run in it.
+    -- Jump over closed bodies so work is bounded by visible rows, not history.
+    vim.api.nvim_win_call(win, function()
+      local line = top + 1
+      local last = math.min(bottom + 1, vim.api.nvim_buf_line_count(buf))
+      while line <= last do
+        local from = vim.fn.foldclosed(line)
+        if from == -1 then
+          line = line + 1
+        else
+          local to = vim.fn.foldclosedend(line)
+          visible_fold_summaries[from - 1] = fold_summary(to - from + 1, width)
+          line = to + 1
+        end
+      end
+    end)
+    return true
+  end,
+  on_line = function(_, _, buf, row)
+    local summary = visible_fold_summaries[row]
+    if not summary then
+      return
+    end
+    -- Closed folds inherit source-line virtual text from Markdown plugins. Mask
+    -- only the summary row, without deleting decorations needed when it opens.
+    vim.api.nvim_buf_set_extmark(buf, M.fold_namespace, row, 0, {
+      ephemeral = true,
+      virt_text = { { summary, 'Folded' } },
+      virt_text_win_col = 0,
+      priority = 65535,
+    })
+  end,
+})
+
+---@param win integer|nil
+---@param buf integer|nil
+---@param ranges? {from: number, to: number}[]
+---@return table<number, boolean>
+function M.get_open_fold_starts(win, buf, ranges)
   if not win or not buf then
     return {}
   end
 
-  local prev_folds = state.ui.get_output_folds().ranges
+  local prev_folds = ranges or state.ui.get_output_folds().ranges
 
   local was_open = {}
   vim.api.nvim_win_call(win, function()
     for _, range in ipairs(prev_folds) do
-      if vim.fn.foldclosed(range.from) == -1 then
+      -- foldclosed == -1 also covers "fold does not exist"; only keep the open
+      -- state of folds that actually exist, or rebuilt folds get opened by mistake.
+      if vim.fn.foldlevel(range.from) > 0 and vim.fn.foldclosed(range.from) == -1 then
         was_open[range.from] = true
       end
     end
@@ -512,9 +555,47 @@ function M.get_open_fold_starts(win, buf)
   return was_open
 end
 
+---Repair only the supplied folds after a buffer rewrite, leaving history alone.
+---Existing open folds stay open; a pre-write snapshot restores deleted open folds.
+---@param ranges {from: integer, to: integer}[]
+---@param was_open? table<number, boolean>
+function M.repair_folds(ranges, was_open)
+  local windows = state.windows
+  if not M.mounted(windows) or #ranges == 0 then
+    return
+  end
+  vim.api.nvim_win_call(windows.output_win, function()
+    local line_count = vim.api.nvim_buf_line_count(windows.output_buf)
+    ---@type table<string, integer>?
+    local view
+    for _, range in ipairs(ranges) do
+      if range.to <= line_count then
+        local exists = vim.fn.foldlevel(range.from) > 0
+        local closed_start = vim.fn.foldclosed(range.from)
+        local closed_end = vim.fn.foldclosedend(range.from)
+        if not exists or (closed_start ~= -1 and (closed_start ~= range.from or closed_end ~= range.to)) then
+          view = view or vim.fn.winsaveview()
+          if exists then
+            vim.cmd(range.from .. 'normal! zd')
+          end
+          vim.cmd(range.from .. ',' .. range.to .. 'fold')
+          if was_open and was_open[range.from] then
+            vim.cmd(range.from .. 'foldopen!')
+          end
+        end
+      end
+    end
+    if view then
+      vim.fn.winrestview(view)
+    end
+  end)
+end
+
 ---Set the folds for the output buffer
 ---@param fold_ranges {from: number, to: number}[]
-function M.set_folds(fold_ranges)
+---@param force? boolean
+---@param open_starts? table<number, boolean>
+function M.set_folds(fold_ranges, force, open_starts)
   local windows = state.windows
   if not M.mounted(windows) then
     return
@@ -525,11 +606,14 @@ function M.set_folds(fold_ranges)
   local folds = build_fold_state(fold_ranges or {})
   local prev_folds = state.ui.get_output_folds()
 
-  if vim.deep_equal(prev_folds.ranges, folds.ranges) then
+  if not force and vim.deep_equal(prev_folds.ranges, folds.ranges) then
     return
   end
 
   local was_open = M.get_open_fold_starts(win, buf)
+  for start in pairs(open_starts or {}) do
+    was_open[start] = true
+  end
   local preserve_view = not M.is_at_bottom(win)
   state.ui.set_output_folds(folds)
 
@@ -664,6 +748,9 @@ function M.clear_extmarks(start_line, end_line, clear_all)
   end_line = end_line or -1
 
   pcall(vim.api.nvim_buf_clear_namespace, windows.output_buf, clear_all and -1 or M.namespace, start_line, end_line)
+  if not clear_all then
+    pcall(vim.api.nvim_buf_clear_namespace, windows.output_buf, output_spinner.namespace, start_line, end_line)
+  end
 end
 
 ---Apply extmarks to any buffer (reusable for preview buffers)
@@ -695,19 +782,25 @@ function M.apply_extmarks(bufnr, extmarks, line_offset)
       local m = type(mark) == 'function' and mark() or mark
       local target_line = line_offset + line_idx --[[@as integer]]
       local start_col = m.start_col
-      -- Only deepcopy when we need to mutate: start_col must be removed from the
-      -- opts table, and end_row must be offset when line_offset is non-zero.
-      -- The vast majority of extmarks (border virt_text) have neither field, so
+      local spinner_chunk = m.spinner_chunk
+      -- Only deepcopy when we need to mutate: start_col/spinner_chunk must be removed
+      -- from the opts table, and end_row must be offset when line_offset is non-zero.
+      -- The vast majority of extmarks (border virt_text) have none of these, so
       -- we avoid 100k+ deepcopy calls during a full session render.
-      if start_col ~= nil or (m.end_row ~= nil and line_offset ~= 0) then
+      if start_col ~= nil or spinner_chunk ~= nil or (m.end_row ~= nil and line_offset ~= 0) then
         m = vim.deepcopy(m)
         m.start_col = nil
+        m.spinner_chunk = nil
         if m.end_row then
           m.end_row = m.end_row + line_offset
         end
       end
       ---@cast m vim.api.keyset.set_extmark
-      pcall(vim.api.nvim_buf_set_extmark, bufnr, M.namespace, target_line, start_col or 0, m)
+      if spinner_chunk then
+        output_spinner.place(bufnr, target_line, start_col or 0, m, spinner_chunk)
+      else
+        pcall(vim.api.nvim_buf_set_extmark, bufnr, M.namespace, target_line, start_col or 0, m)
+      end
     end
   end
 end

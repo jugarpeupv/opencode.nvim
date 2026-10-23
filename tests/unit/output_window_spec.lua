@@ -289,6 +289,58 @@ describe('output_window.setup', function()
     assert.equals(3, fold_end)
   end)
 
+  it('repairs a deleted fold without rebuilding unrelated history folds', function()
+    output_window.setup({ output_buf = buf, output_win = win })
+    output_window.set_lines({ 'old', 'old body', '', 'tool', 'body', 'tail' })
+    local ranges = { { from = 1, to = 2 }, { from = 5, to = 6 } }
+    output_window.set_folds(ranges)
+    vim.api.nvim_win_call(win, function()
+      vim.cmd('1foldopen!')
+      vim.cmd('5normal! zd')
+    end)
+    local rebuild = stub(output_window, 'set_folds')
+    output_window.repair_folds({ ranges[2] })
+    assert.stub(rebuild).was_not_called()
+    rebuild:revert()
+    vim.api.nvim_win_call(win, function()
+      assert.equals(-1, vim.fn.foldclosed(1))
+      assert.equals(5, vim.fn.foldclosed(5))
+      assert.equals(6, vim.fn.foldclosedend(5))
+    end)
+  end)
+
+  it('restores a deleted user-opened fold from its pre-write snapshot', function()
+    output_window.setup({ output_buf = buf, output_win = win })
+    output_window.set_lines({ 'title', 'body', 'tail', '' })
+    local ranges = { { from = 2, to = 4 } }
+    output_window.set_folds(ranges)
+    vim.api.nvim_win_call(win, function()
+      vim.cmd('2foldopen!')
+    end)
+    local was_open = output_window.get_open_fold_starts(win, buf, ranges)
+    vim.api.nvim_win_call(win, function()
+      vim.cmd('2normal! zd')
+    end)
+    output_window.repair_folds(ranges, was_open)
+    vim.api.nvim_win_call(win, function()
+      assert.equals(1, vim.fn.foldlevel(2))
+      assert.equals(-1, vim.fn.foldclosed(2))
+    end)
+  end)
+
+  it('does not issue fold commands for intact folds during repeated repairs', function()
+    output_window.setup({ output_buf = buf, output_win = win })
+    output_window.set_lines({ 'title', 'body', 'tail', '' })
+    local ranges = { { from = 2, to = 4 } }
+    output_window.set_folds(ranges)
+    local commands = stub(vim, 'cmd')
+    for _ = 1, 100 do
+      output_window.repair_folds(ranges)
+    end
+    assert.stub(commands).was_not_called()
+    commands:revert()
+  end)
+
   it('preserves an open fold when its range changes', function()
     output_window.setup({ output_buf = buf, output_win = win })
     output_window.set_lines({ 'a', 'b', 'c', 'd', 'e', 'f' })
@@ -305,6 +357,47 @@ describe('output_window.setup', function()
     end)
 
     assert.equals(-1, fold_closed)
+  end)
+end)
+
+describe('output_window.restore_view_topline', function()
+  local buf
+  local win
+  local command_stub
+
+  before_each(function()
+    buf = vim.api.nvim_create_buf(false, true)
+    local lines = {}
+    for i = 1, 30 do
+      lines[i] = tostring(i)
+    end
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+    win = vim.api.nvim_open_win(buf, true, {
+      relative = 'editor',
+      width = 80,
+      height = 10,
+      row = 0,
+      col = 0,
+    })
+  end)
+
+  after_each(function()
+    if command_stub then
+      command_stub:revert()
+      command_stub = nil
+    end
+    pcall(vim.api.nvim_win_close, win, true)
+    pcall(vim.api.nvim_buf_delete, buf, { force = true })
+  end)
+
+  it('restores the viewport without forcing a synchronous redraw', function()
+    vim.api.nvim_win_set_cursor(win, { 8, 0 })
+    command_stub = stub(vim, 'cmd')
+
+    output_window.restore_view_topline(win, 4)
+
+    assert.equals(4, output_window.get_visible_top_line(win))
+    assert.stub(command_stub).was_not_called()
   end)
 end)
 

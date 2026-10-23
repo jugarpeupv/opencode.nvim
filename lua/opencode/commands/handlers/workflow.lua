@@ -17,18 +17,6 @@ local M = {
   actions = {},
 }
 
----@param message string
----@return OpencodeSession|nil
-local function get_active_session_or_warn(message)
-  local active_session = state.active_session
-  if not active_session then
-    vim.notify(message, vim.log.levels.WARN)
-    return nil
-  end
-
-  return active_session
-end
-
 ---@param command string
 ---@param args string[]|nil
 local function schedule_slash_history(command, args)
@@ -45,21 +33,6 @@ local function join_args(args)
     return ''
   end
   return table.concat(args, ' ')
-end
-
-local function send_user_command(session, input)
-  local connection = state.opencode_server
-  if not connection or not connection:is_ready() then
-    error('Connection is not ready')
-  end
-  return connection.operations.send_command(
-    connection,
-    session.id,
-    session.location,
-    input,
-    util.apply_path_map,
-    util.apply_reverse_path_map
-  )
 end
 
 ---@param prompt string
@@ -235,6 +208,27 @@ for _, action_name in ipairs({ 'debug_output', 'debug_message', 'debug_session' 
   end
 end
 
+---@param args string[]
+function M.actions.debug(args)
+  local debug_helper = require('opencode.ui.debug_helper')
+  local subcommand = args[1]
+  if subcommand == 'events' then
+    if #args > 2 then
+      error({ code = 'invalid_arguments', message = 'Usage: :Opencode debug events [filename]' }, 0)
+    end
+    return debug_helper.save_captured_events(args[2])
+  end
+
+  if subcommand == 'log' then
+    if #args > 1 then
+      error({ code = 'invalid_arguments', message = 'Usage: :Opencode debug log' }, 0)
+    end
+    return debug_helper.open_log()
+  end
+
+  error({ code = 'invalid_arguments', message = 'Invalid debug subcommand. Use: events, log' }, 0)
+end
+
 function M.actions.paste_image()
   local image_path = require('opencode.image_handler').save_clipboard_image()
   if not image_path then
@@ -341,7 +335,9 @@ M.actions.submit_input_prompt = Promise.async(function()
     return
   end
 
-  require('opencode.services.messaging').send_message(input_content)
+  require('opencode.services.messaging').send_message(input_content):catch(function(err)
+    require('opencode.log').notify('Error sending message: ' .. vim.inspect(err), vim.log.levels.ERROR)
+  end)
   if config.ui.input.auto_hide and not input_window.is_hidden() then
     input_window._hide()
   end
@@ -396,19 +392,18 @@ M.actions.run_user_command = Promise.async(function(name, args)
     end
   end
 
-  local active_session = get_active_session_or_warn('No active session')
-  if not active_session then
-    return
+  local result = require('opencode.services.messaging')
+    .send_user_command({
+      command = name,
+      arguments = join_args(args),
+      model = model,
+      agent = agent,
+      variant = state.current_variant,
+    })
+    :await()
+  if result ~= false then
+    schedule_slash_history(name, args)
   end
-
-  send_user_command(active_session, {
-    command = name,
-    arguments = join_args(args),
-    model = model,
-    agent = agent,
-    variant = state.current_variant,
-  }):await()
-  schedule_slash_history(name, args)
 end)
 
 function M.actions.first_message()
@@ -501,15 +496,17 @@ M.actions.review = Promise.async(function(args)
 
   state.session.set_active(new_session)
   window_handler.actions.open_input():await()
-  return send_user_command(state.active_session, {
-    command = 'review',
-    arguments = join_args(args),
-    model = state.current_model,
-    agent = state.current_mode,
-    variant = state.current_variant,
-  }):and_then(function()
-    schedule_slash_history('review', args)
-  end)
+  return require('opencode.services.messaging')
+    .send_user_command({
+      command = 'review',
+      arguments = join_args(args),
+      model = state.current_model,
+      agent = state.current_mode,
+      variant = state.current_variant,
+    })
+    :and_then(function()
+      schedule_slash_history('review', args)
+    end)
 end)
 
 M.actions.add_visual_selection = Promise.async(
@@ -550,7 +547,7 @@ M.actions.add_visual_selection_inline = Promise.async(
 
 M.command_defs = {
   quick_chat = {
-    desc = 'Quick chat with current buffer or visual selection',
+    desc = 'Quick chat about the cursor line (±10 lines) or visual selection',
     range = true,
     nargs = '+',
     complete = false,
@@ -688,6 +685,12 @@ M.command_defs = {
   debug_session = {
     desc = 'Open raw session debug view',
     execute = M.actions.debug_session,
+  },
+  debug = {
+    desc = 'Export captured events or open plugin log',
+    completions = { 'events', 'log' },
+    nested_subcommand = { allow_empty = false },
+    execute = M.actions.debug,
   },
   toggle_tool_output = {
     desc = 'Toggle tool output visibility in the output window',

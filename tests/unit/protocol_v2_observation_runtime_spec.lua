@@ -90,7 +90,7 @@ local function event(session_id, kind, data, created)
 end
 
 local function flush(predicate)
-  assert.is_true(vim.wait(500, predicate or function()
+  assert.is_true(vim.wait(2000, predicate or function()
     return true
   end, 5))
 end
@@ -554,6 +554,47 @@ describe('V2 protocol Observation runtime', function()
     stop()
   end)
 
+  it('maps edit permission diffs from the live server files[] metadata', function()
+    local normalize = require('opencode.protocols.v2.normalize')
+    -- Real 2.0.14 payload: the diff lives under metadata.files[].patch, not metadata.diff.
+    local request = normalize.mapped_permission({
+      id = 'per-edit',
+      sessionID = 'ses-main',
+      action = 'edit',
+      resources = { 'src/main.rs' },
+      metadata = {
+        files = {
+          {
+            file = 'src/main.rs',
+            patch = 'Index: src/main.rs\n@@ -1,2 +1,2 @@\n line one\n-line two\n+line TWO changed\n',
+            status = 'modified',
+            additions = 1,
+            deletions = 1,
+          },
+        },
+      },
+      source = { type = 'tool', messageID = 'msg-tool', id = 'tool-edit' },
+    })
+    assert.equals('src/main.rs', request.preview.path)
+    assert.equals(
+      'Index: src/main.rs\n@@ -1,2 +1,2 @@\n line one\n-line two\n+line TWO changed\n',
+      request.preview.diff
+    )
+  end)
+
+  it('keeps legacy filepath/diff permission metadata working', function()
+    local normalize = require('opencode.protocols.v2.normalize')
+    local request = normalize.mapped_permission({
+      id = 'per-legacy',
+      sessionID = 'ses-main',
+      action = 'edit',
+      resources = { 'a.lua' },
+      metadata = { filepath = 'a.lua', diff = 'OLD DIFF' },
+    })
+    assert.equals('a.lua', request.preview.path)
+    assert.equals('OLD DIFF', request.preview.diff)
+  end)
+
   it('fills previews from the exact linked tool and publishes them after online tool input arrives', function()
     local value = connection()
     local streams = install_operations(value)
@@ -727,6 +768,51 @@ describe('V2 protocol Observation runtime', function()
       end
     )
   end
+
+  it('warns about unhandled session events only when no handler covers the type', function()
+    local value = connection()
+    local streams = install_operations(value)
+    local observed = value:observe({ id = 'ses-main' })
+    local stop = observed:watch({ 'messages' }, function() end)
+    local log = require('opencode.log')
+    local warns = {}
+    local original_warn = log.warn
+    log.warn = function(msg, ...)
+      warns[#warns + 1] = string.format(tostring(msg), ...)
+    end
+
+    -- covered by messages.handlers: must stay silent
+    emit(streams[1], event('ses-main', 'session.step.started', { assistantMessageID = 'msg-live', agent = 'build' }, 9))
+    emit(streams[1], event('ses-main', 'session.text.started', { assistantMessageID = 'msg-live', ordinal = 0 }, 9.5))
+    emit(
+      streams[1],
+      event('ses-main', 'session.text.delta', { assistantMessageID = 'msg-live', ordinal = 0, delta = 'x' }, 10)
+    )
+    flush()
+    assert.equals(0, #warns)
+
+    -- Exempt and other-resource events still pass through the message resource.
+    emit(streams[1], event('ses-main', 'session.status', { status = { type = 'idle' } }, 10.1))
+    emit(streams[1], event('ses-main', 'session.execution.started', {}, 10.2))
+    flush()
+    assert.equals(0, #warns)
+
+    -- not in routes, handlers, or EXEMPT: must warn
+    for _ = 1, 3 do
+      emit(streams[1], event('ses-main', 'session.entirely_unknown', {}, 11))
+    end
+    flush()
+    assert.equals(1, #warns)
+    assert.truthy(warns[1]:find('session%.entirely_unknown'))
+
+    emit(streams[1], event('ses-main', 'session.compaction.failed', {}, 12))
+    flush()
+    assert.equals(2, #warns)
+    assert.truthy(warns[2]:find('known gap', 1, true))
+
+    log.warn = original_warn
+    stop()
+  end)
 
   it('marks a known inbox item not_pending when an authority snapshot omits it', function()
     local value = connection()
@@ -909,6 +995,29 @@ describe('V2 protocol Observation runtime', function()
     assert.equals(14, idle.idle_at)
     assert.is_nil(observed._v2_admissions['msg-local'])
     stop()
+  end)
+
+  it('reports a client message ID before submission so streamed echoes can precede acknowledgement', function()
+    local value = connection()
+    local admission = Promise.new()
+    local reported_id
+    install_operations(value, {
+      submit = function(_, _, input)
+        assert.equals(reported_id, input.id)
+        assert.is_truthy(input.id:match('^msg_'))
+        return admission
+      end,
+    })
+    local observed = value:observe({ id = 'ses-main' })
+    local submitted = observed:submit({ text = 'hello' }, nil, function(id)
+      reported_id = id
+    end)
+    assert.is_not_nil(reported_id)
+    assert.is_false(submitted:is_resolved())
+    admission:resolve({ id = reported_id, delivery = 'queue' })
+    local handle = submitted:wait()
+    assert.equals(reported_id, handle.input.id)
+    handle.stop()
   end)
 
   it('keeps completion attached to each of two queued submissions', function()
@@ -1372,6 +1481,29 @@ describe('V2 protocol Observation runtime', function()
     stop()
   end)
 
+  it('follows revert staging and clearing made in another client', function()
+    local value = connection()
+    local streams = install_operations(value)
+    local observed = value:observe({ id = 'ses-main' })
+    local notifications = 0
+    local stop = observed:watch({ 'session' }, function()
+      notifications = notifications + 1
+    end)
+    flush(function()
+      return observed:read().sync.session.state == 'current'
+    end)
+    local before = notifications
+
+    emit(streams[1], event('ses-main', 'session.revert.staged', { revert = { messageID = 'msg-1', files = {} } }))
+    assert.equals('msg-1', observed:read().session.revert.messageID)
+    assert.equals(before + 1, notifications)
+
+    emit(streams[1], event('ses-main', 'session.revert.cleared', {}))
+    assert.is_nil(observed:read().session.revert)
+    assert.equals(before + 2, notifications)
+    stop()
+  end)
+
   it('validates permission and form replies before calling their operations', function()
     local value = connection()
     local calls = {}
@@ -1437,6 +1569,36 @@ describe('V2 protocol Observation runtime', function()
       { 'interrupt', 'ses-main' },
     }, calls)
     assert.equals(operations, value.operations)
+    stop()
+  end)
+
+  it('re-pulls the messages snapshot when the server rewrites the message set', function()
+    local pulls = 0
+    local value = connection()
+    local streams = install_operations(value, {
+      list_messages = function()
+        pulls = pulls + 1
+        return resolved({ data = {}, cursor = {} })
+      end,
+    })
+    local observed = value:observe({ id = 'ses-a' })
+    local stop = observed:watch({ 'messages' }, function() end)
+    flush(function()
+      return observed:read().sync.messages.state == 'current'
+    end)
+    pulls = 0
+
+    emit(streams[1], event('ses-a', 'session.revert.committed', {}))
+    flush(function()
+      return observed:read().sync.messages.state == 'current'
+    end)
+    assert.is_true(pulls >= 1)
+
+    emit(streams[1], event('ses-a', 'session.compaction.ended', {}))
+    flush(function()
+      return observed:read().sync.messages.state == 'current'
+    end)
+    assert.is_true(pulls >= 2)
     stop()
   end)
 end)

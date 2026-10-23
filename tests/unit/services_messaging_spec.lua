@@ -15,6 +15,7 @@ local Promise = require('opencode.promise')
 local stub = require('luassert.stub')
 local assert = require('luassert')
 local support = require('tests.unit.services_spec_support')
+local optimistic = require('opencode.state.optimistic')
 
 local function successful_submission(message)
   local result = { kind = 'reply', input_id = 'msg-user', message = message or { id = 'msg-reply' } }
@@ -58,6 +59,207 @@ describe('opencode.services.messaging', function()
     messaging.run_skill('review', 'Review current changes'):wait()
     assert.stub(send).was_called_with('Review current changes', { skills = { { id = 'native-review' } } })
     send:revert()
+  end)
+
+  describe('actions in draft sessions', function()
+    local create
+    local observation
+    local ready
+    local released
+    local tab
+
+    before_each(function()
+      session_tabs.reset()
+      state.session.set_active(nil)
+      tab = session_tabs.ensure_current()
+      connection.protocol = 'v2'
+      observation = connection:observe({ id = 'draft-skill' })
+      observation._state.sync.session.state = 'unread'
+      released = false
+      ready = nil
+      observation.watch = function(_, _, changed)
+        ready = function()
+          observation._state.sync.session.state = 'current'
+          changed(observation)
+        end
+        return function()
+          released = true
+        end
+      end
+      connection.operations.list_skills = function()
+        assert.is_false(released)
+        return Promise.new():resolve({ { id = 'native-review', name = 'review', content = 'skill instructions' } })
+      end
+      create = stub(require('opencode.services.session_runtime'), 'create_detached_session').returns(
+        Promise.new():resolve({ session = { id = 'draft-skill' }, observation = observation, connection = connection })
+      )
+    end)
+
+    after_each(function()
+      create:revert()
+      session_tabs.reset()
+    end)
+
+    it('waits for session metadata and retains its subscription through native activation', function()
+      local activation = Promise.new()
+      local activated
+      observation.activate_skill = function(_, id)
+        assert.is_false(released)
+        activated = id
+        return activation
+      end
+      local running = messaging.run_skill('review')
+      assert.is_nil(activated)
+      assert.is_true(vim.wait(1000, function()
+        return ready ~= nil
+      end))
+      ready()
+      assert.is_true(vim.wait(1000, function()
+        return activated ~= nil
+      end))
+      assert.equals('draft-skill', state.active_session.id)
+      assert.equals('native-review', activated)
+      assert.is_false(released)
+      activation:resolve(true)
+      assert.is_true(running:wait())
+      assert.is_true(released)
+      assert.is_nil(tab._draft_release)
+      assert.stub(create).was_called(1)
+    end)
+
+    for _, protocol in ipairs({ 'v1', 'v2' }) do
+      it('sends ' .. protocol .. ' skill instructions after creating the draft session', function()
+        connection.protocol = protocol
+        local send = stub(messaging, 'send_message').invokes(function()
+          assert.equals('draft-skill', state.active_session.id)
+          assert.is_false(released)
+          return Promise.new():resolve(true)
+        end)
+        local running = messaging.run_skill('review', 'Review current changes')
+        assert.is_true(vim.wait(1000, function()
+          return ready ~= nil
+        end))
+        ready()
+        assert.is_true(running:wait())
+        if protocol == 'v2' then
+          assert.stub(send).was_called_with('Review current changes', { skills = { { id = 'native-review' } } })
+        else
+          assert.stub(send).was_called_with('skill instructions\n\nReview current changes', {})
+        end
+        assert.is_true(released)
+        send:revert()
+      end)
+    end
+
+    for _, failure in ipairs({ 'catalog', 'activation' }) do
+      it('releases the draft subscription on ' .. failure .. ' failure', function()
+        if failure == 'catalog' then
+          connection.operations.list_skills = function()
+            return Promise.new():reject('catalog failed')
+          end
+        else
+          observation.activate_skill = function()
+            return Promise.new():reject('activation failed')
+          end
+        end
+        local running = messaging.run_skill('review')
+        assert.is_true(vim.wait(1000, function()
+          return ready ~= nil
+        end))
+        ready()
+        local ok, err = pcall(function()
+          running:wait()
+        end)
+        assert.is_false(ok)
+        assert.matches(failure .. ' failed', tostring(err))
+        assert.is_true(released)
+        assert.is_nil(tab._draft_release)
+      end)
+    end
+
+    it('returns false when draft creation fails', function()
+      create.returns(Promise.new():reject('create failed'))
+      assert.is_false(messaging.run_skill('review'):wait())
+      assert.is_nil(state.active_session)
+      assert.is_nil(tab._draft_release)
+    end)
+
+    it('does not activate a skill when its draft tab closes while metadata loads', function()
+      local activate = stub(observation, 'activate_skill')
+      local running = messaging.run_skill('review')
+      assert.is_true(vim.wait(1000, function()
+        return ready ~= nil
+      end))
+      session_tabs.remove(tab)
+      assert.is_false(running:wait())
+      assert.is_true(released)
+      assert.stub(activate).was_not_called()
+      activate:revert()
+    end)
+
+    it('executes a user-defined command from a draft through its command handler', function()
+      local window = require('opencode.commands.handlers.window')
+      local open = stub(window.actions, 'open_input').returns(Promise.new():resolve(true))
+      local catalog = stub(config_file, 'get_user_commands').returns(Promise.new():resolve({ review = {} }))
+      local request = Promise.new()
+      local sent
+      connection.operations.send_command = function(_, session_id, _, input)
+        assert.is_false(released)
+        sent = { session_id = session_id, input = input }
+        return request
+      end
+      local running = require('opencode.commands.handlers.workflow').actions.run_user_command('review', { 'changes' })
+      assert.is_true(vim.wait(1000, function()
+        return ready ~= nil
+      end))
+      ready()
+      assert.is_true(vim.wait(1000, function()
+        return sent ~= nil
+      end))
+      assert.equals('draft-skill', sent.session_id)
+      assert.equals('review', sent.input.command)
+      assert.equals('changes', sent.input.arguments)
+      assert.is_false(released)
+      request:resolve(true)
+      running:wait()
+      assert.is_true(released)
+      open:revert()
+      catalog:revert()
+    end)
+
+    it('releases the draft subscription when a user command request fails', function()
+      connection.operations.send_command = function()
+        return Promise.new():reject('command failed')
+      end
+      local running = messaging.send_user_command({ command = 'review', arguments = '' })
+      assert.is_true(vim.wait(1000, function()
+        return ready ~= nil
+      end))
+      ready()
+      local ok, err = pcall(function()
+        running:wait()
+      end)
+      assert.is_false(ok)
+      assert.matches('command failed', tostring(err))
+      assert.is_true(released)
+    end)
+
+    it('shares draft creation between prompt submission and skill activation', function()
+      observation.activate_skill = function()
+        assert.is_false(released)
+        return Promise.new():resolve(true)
+      end
+      local skill = messaging.run_skill('review')
+      local prompt = messaging.send_message('hello')
+      assert.is_true(vim.wait(1000, function()
+        return ready ~= nil
+      end))
+      ready()
+      assert.is_true(skill:wait())
+      prompt:wait()
+      assert.stub(create).was_called(1)
+      assert.is_true(released)
+    end)
   end)
 
   it('keeps V1 skill content-pasting behavior separate', function()
@@ -122,12 +324,121 @@ describe('opencode.services.messaging', function()
     state.session.active_observation().submit = orig
   end)
 
-  it('returns false when active session is missing', function()
+  it('shows pending text before preparation and reconciles a delayed admission', function()
+    state.session.set_active({ id = 'optimistic-send' })
+    local observation = state.session.active_observation()
+    local preparation = Promise.new()
+    local admission = Promise.new()
+    local completion = Promise.new()
+    local format = stub(context, 'format_message').returns(preparation)
+    local bind
+    observation.submit = function(_, _, _, on_input_id)
+      bind = on_input_id
+      return admission
+    end
+    local send = messaging.send_message('instant feedback')
+    assert.is_true(vim.wait(1000, function()
+      return optimistic.is_sending(observation)
+    end))
+    assert.equals('instant feedback', optimistic.project(observation, {})[1].content[1].text)
+    preparation:resolve({ text = 'instant feedback', files = {}, agents = {}, context = {} })
+    assert.is_true(vim.wait(1000, function()
+      return bind ~= nil
+    end))
+    bind('echo')
+    local echo = { id = 'echo', kind = 'user', content = {} }
+    observation._state.entries_by_id.echo = echo
+    admission:resolve({ kind = 'accepted', input = { id = 'echo' }, completion = completion })
+    assert.same({ echo }, optimistic.project(observation, { echo }))
+    completion:resolve({ kind = 'session_idle', outcome = 'succeeded', idle_at = 1 })
+    send:wait()
+    assert.is_false(optimistic.is_sending(observation))
+    format:revert()
+  end)
+
+  it('creates a session on the first prompt when the tab is a draft', function()
     state.ui.set_windows({ mock = 'windows' })
     state.session.set_active(nil)
+    local tab = session_tabs.ensure_current()
 
+    local submitted
+    local observation = {
+      _state = {
+        session = { id = 'draft-session' },
+        sync = { session = { state = 'unread' } },
+      },
+      read = function(self)
+        return self._state
+      end,
+      watch = function(self, _, changed)
+        self._state.sync.session = { state = 'current' }
+        changed(self)
+        return function() end
+      end,
+      submit = function()
+        submitted = true
+        return successful_submission()
+      end,
+      validate_message_options = function() end,
+      prepare_message = function()
+        return {}, {}
+      end,
+    }
+    local session_runtime = require('opencode.services.session_runtime')
+    local create = stub(session_runtime, 'create_detached_session').returns(Promise.new():resolve({
+      session = { id = 'draft-session' },
+      observation = observation,
+      connection = connection,
+    }))
+
+    local sent = messaging.send_message('hello world')
+    assert.is_true(vim.wait(1000, function()
+      return sent:is_resolved()
+    end))
+    assert.equals('draft-session', state.active_session.id)
+    assert.is_true(submitted)
+    assert.stub(create).was_called(1)
+    create:revert()
+    session_tabs.reset()
+    tab = nil
+  end)
+
+  it('returns false and keeps the prompt when the draft session cannot be created', function()
+    local buf = vim.api.nvim_create_buf(false, true)
+    state.ui.set_windows({ input_buf = buf })
+    state.session.set_active(nil)
+    local tab = session_tabs.ensure_current()
+
+    local session_runtime = require('opencode.services.session_runtime')
+    local create = stub(session_runtime, 'create_detached_session').returns(Promise.new():reject('create failed'))
     local sent = messaging.send_message('hello world'):wait()
     assert.is_false(sent)
+    assert.same({ 'hello world' }, state.input_content)
+    create:revert()
+    session_tabs.reset()
+  end)
+
+  it('returns false without error when the draft tab is closed during creation', function()
+    local buf = vim.api.nvim_create_buf(false, true)
+    state.ui.set_windows({ input_buf = buf })
+    state.session.set_active(nil)
+    local tab = session_tabs.ensure_current()
+
+    local session_runtime = require('opencode.services.session_runtime')
+    local creation = Promise.new()
+    local create = stub(session_runtime, 'create_detached_session').returns(creation)
+    local sent = messaging.send_message('hello world')
+    session_tabs.remove(tab)
+    vim.api.nvim_buf_delete(buf, { force = true })
+    creation:resolve({
+      session = { id = 'draft-session' },
+      observation = connection:observe({ id = 'draft-session' }),
+      connection = connection,
+    })
+    local result = sent:wait()
+    assert.is_false(result)
+    create:revert()
+    session_tabs.reset()
   end)
 
   it('does not submit before the active session fact is current', function()
@@ -216,6 +527,58 @@ describe('opencode.services.messaging', function()
 
     assert.equal('plan', selected_mode)
     observation.submit = original_submit
+    state.model.set_mode(previous_mode)
+  end)
+
+  it('does not fetch message defaults for observations that do not need them', function()
+    state.session.set_active({ id = 'sess-v2' })
+    connection.protocol = 'v2'
+    local config_stub = stub(config_file, 'get_opencode_config')
+    local agents_stub = stub(config_file, 'get_opencode_agents')
+    local observation = state.session.active_observation()
+    local original_submit = observation.submit
+    observation.submit = function()
+      return successful_submission()
+    end
+
+    messaging.send_message('hello'):wait()
+
+    assert.stub(config_stub).was_not_called()
+    assert.stub(agents_stub).was_not_called()
+    observation.submit = original_submit
+    config_stub:revert()
+    agents_stub:revert()
+  end)
+
+  it('passes server defaults to observations that need them', function()
+    state.session.set_active({ id = 'sess1' })
+    local previous_model = state.current_model
+    local previous_mode = state.current_mode
+    state.model.set_model(nil)
+    state.model.set_mode('plan')
+    local config_stub = stub(config_file, 'get_opencode_config').returns(Promise.new():resolve({ model = 'p/default' }))
+    local agents_stub = stub(config_file, 'get_opencode_agents').returns(Promise.new():resolve({ 'plan' }))
+    local observation = state.session.active_observation()
+    local original_prepare = observation.prepare_message
+    local received
+    observation.prepare_message = function(self, opts, selected)
+      received = vim.deepcopy(selected)
+      return original_prepare(self, opts, selected)
+    end
+    local original_submit = observation.submit
+    observation.submit = function()
+      return successful_submission()
+    end
+
+    messaging.send_message('hello'):wait()
+
+    assert.equal('p/default', received.default_model)
+    assert.same({ 'plan' }, received.available_agents)
+    observation.prepare_message = original_prepare
+    observation.submit = original_submit
+    config_stub:revert()
+    agents_stub:revert()
+    state.model.set_model(previous_model)
     state.model.set_mode(previous_mode)
   end)
 
@@ -521,6 +884,9 @@ describe('opencode.services.messaging', function()
 
     assert.is_false(ok)
     assert.same({ '/tmp/attached.lua' }, context.get_context().mentioned_files)
+    local observation = state.session.active_observation()
+    assert.is_false(optimistic.is_sending(observation))
+    assert.equals('failed', optimistic.project(observation, {})[1].local_status)
     config_stub:revert()
     context.restore(original_context)
   end)
@@ -556,6 +922,8 @@ describe('opencode.services.messaging', function()
     assert.equal(0, count_before)
     assert.equal(1, count_during)
     assert.equal(0, count_after)
+    assert.is_false(optimistic.is_sending(state.session.active_observation()))
+    assert.equals('failed', optimistic.project(state.session.active_observation(), {})[1].local_status)
     assert.same({}, context.get_context().mentioned_files)
     assert.same({}, context.get_context().selections)
 
@@ -581,6 +949,8 @@ describe('opencode.services.messaging', function()
     local result = messaging.send_message('hello'):wait()
 
     assert.is_nil(result)
+    assert.is_false(optimistic.is_sending(observation))
+    assert.equals('unknown', optimistic.project(observation, {})[1].local_status)
     assert.stub(after_run).was_called(1)
     after_run:revert()
   end)

@@ -196,7 +196,8 @@ local function write_in_place(cached, previous_formatted, formatted_data)
   local clear_start, clear_end =
     extmark_clear_range(previous_formatted, formatted_data, cached.line_start, old_line_end, new_line_end, prefix_len)
 
-  output_window.clear_extmarks(clear_start, clear_end)
+  -- The buffer still has the old layout: the new extent may overlap following parts.
+  output_window.clear_extmarks(clear_start, math.min(clear_end, old_line_end + 1))
   output_window.set_lines(lines_to_write, write_start, cached.line_end + 1)
   highlight_written_lines(write_start, lines_to_write)
 
@@ -490,6 +491,12 @@ function M.upsert_part_now(part_id, message_id, formatted_data, previous_formatt
 
   local cached = ctx.render_state:get_part(part_id)
   if cached and cached.line_start and cached.line_end then
+    local part_folds = ctx.part_folds[part_id]
+    local open_starts
+    local windows = state.windows
+    if part_folds and #part_folds > 0 and windows then
+      open_starts = output_window.get_open_fold_starts(windows.output_win, windows.output_buf, part_folds)
+    end
     local prefix_len, old_line_end, new_line_end = write_in_place(cached, previous_formatted, formatted_data)
 
     apply_part_render_data(ctx, part_id, formatted_data, cached.line_start)
@@ -501,8 +508,8 @@ function M.upsert_part_now(part_id, message_id, formatted_data, previous_formatt
     end
     apply_extmarks(previous_formatted, formatted_data, cached.line_start, old_line_end, new_line_end, prefix_len, true)
 
-    if formatted_data.fold_ranges then
-      M.update_part_folds(part_id, ctx)
+    if formatted_data.fold_ranges and (#formatted_data.fold_ranges > 0 or (part_folds and #part_folds > 0)) then
+      M.update_part_folds(part_id, true, ctx, open_starts)
     end
 
     return true
@@ -546,8 +553,8 @@ function M.set_all_folds(ctx)
         local part_abs_folds = {}
         for _, f in ipairs(data.fold_ranges) do
           local abs = {
-            from = cached_part.line_start + f.from - 1,
-            to = cached_part.line_start + f.to - 1,
+            from = cached_part.line_start + f.from,
+            to = cached_part.line_start + f.to,
           }
           table.insert(part_abs_folds, abs)
           table.insert(all_folds, abs)
@@ -576,9 +583,12 @@ local function folds_equal(a, b)
 end
 
 ---Update folds for a single part during streaming, avoiding a full rebuild.
+---`force` checks native folds even when recorded ranges match: rewrites can drop them.
 ---@param part_id string
+---@param force? boolean
 ---@param ctx? RendererCtx
-function M.update_part_folds(part_id, ctx)
+---@param open_starts? table<number, boolean>
+function M.update_part_folds(part_id, force, ctx, open_starts)
   ctx = ctx or contexts.current()
   local formatted_data = ctx.formatted_parts[part_id]
   if not formatted_data or not formatted_data.fold_ranges then
@@ -594,12 +604,20 @@ function M.update_part_folds(part_id, ctx)
   local new_folds = {}
   for _, f in ipairs(formatted_data.fold_ranges) do
     table.insert(new_folds, {
-      from = cached_part.line_start + f.from - 1,
-      to = cached_part.line_start + f.to - 1,
+      from = cached_part.line_start + f.from,
+      to = cached_part.line_start + f.to,
     })
   end
 
-  if folds_equal(ctx.part_folds[part_id], new_folds) then
+  local previous_folds = ctx.part_folds[part_id]
+  if #new_folds == 0 and (not previous_folds or #previous_folds == 0) then
+    ctx.part_folds[part_id] = new_folds
+    return
+  end
+  if folds_equal(previous_folds, new_folds) then
+    if force then
+      output_window.repair_folds(new_folds, open_starts)
+    end
     return
   end
 
@@ -611,8 +629,8 @@ function M.update_part_folds(part_id, ctx)
       if p and p.line_start then
         for _, f in ipairs(data.fold_ranges) do
           table.insert(new_global, {
-            from = p.line_start + f.from - 1,
-            to = p.line_start + f.to - 1,
+            from = p.line_start + f.from,
+            to = p.line_start + f.to,
           })
         end
       end
@@ -622,7 +640,7 @@ function M.update_part_folds(part_id, ctx)
     return a.from < b.from
   end)
   ctx.global_folds = new_global
-  output_window.set_folds(new_global)
+  output_window.set_folds(new_global, false, open_starts)
 end
 
 ---@param part_id string
@@ -636,7 +654,7 @@ function M.refresh_part_metadata(part_id, formatted_data, previous, ctx)
   end
   apply_part_render_data(ctx, part_id, formatted_data, cached.line_start)
   if not vim.deep_equal(previous and previous.fold_ranges or {}, formatted_data.fold_ranges or {}) then
-    M.update_part_folds(part_id, ctx)
+    M.update_part_folds(part_id, false, ctx)
   end
 end
 
@@ -675,7 +693,7 @@ function M.append_part_now(part_id, extra_lines, extra_extmarks, previous_format
       prefix_len
     )
     if formatted_data.fold_ranges then
-      M.update_part_folds(part_id, ctx)
+      M.update_part_folds(part_id, false, ctx)
     end
   elseif has_extmarks(extra_extmarks) then
     output_window.set_extmarks(extra_extmarks, insert_at)
