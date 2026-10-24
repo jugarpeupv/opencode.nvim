@@ -535,3 +535,5 @@ require('opencode.ui.renderer.ctx').prompt_controllers.permission = M
 require('opencode.ui.formatter.system').register('permissions-display', function(output)
   M.format_display(output)
 end)
+
+return M
