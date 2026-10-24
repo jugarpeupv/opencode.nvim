@@ -48,7 +48,6 @@ local M = {
   _interaction = nil,
   _observations = {},
 } --[[@as PermissionWindow]]
-local notified_permissions = {}
 
 ---@param permission_id string
 ---@return boolean
@@ -481,29 +480,14 @@ function M.sync(observations)
   local pending = {}
   ---@type table<string, OpencodeObservation>
   local owners = {}
-  local current_permissions = {}
-  for _, observation in ipairs(observations or {}) do
-    local observed = observation:read()
-    for _, request in pairs(observed.permission_requests_by_id or {}) do
+  for _, observation in ipairs(observations) do
+    for _, request in pairs(observation:read().permission_requests_by_id or {}) do
       if request.status == 'pending' then
         pending[#pending + 1] = request
         owners[request.id] = observation
-        current_permissions[request.id] = true
-        -- Same once-per-id contract as questions: re-fires if the id returns to pending.
-        if not notified_permissions[request.id] and config.hooks and config.hooks.on_permission_requested then
-          pcall(config.hooks.on_permission_requested, observed.session)
-        end
-        local session_id = request.session_id or request.sessionID
-        if session_id then
-          local runtime = session_tabs.find_by_session_id(session_id)
-          if runtime then
-            session_tabs.add_pending_permission(runtime.id, request)
-          end
-        end
       end
     end
   end
-  notified_permissions = current_permissions
   table.sort(pending, function(left, right)
     local left_session = left.session_id or left.sessionID or ''
     local right_session = right.session_id or right.sessionID or ''
@@ -532,7 +516,6 @@ function M.clear_all()
   M._clear_dialog()
   M._permission_queue = {}
   M._observations = {}
-  notified_permissions = {}
 end
 
 ---Get all permissions
@@ -552,5 +535,3 @@ require('opencode.ui.renderer.ctx').prompt_controllers.permission = M
 require('opencode.ui.formatter.system').register('permissions-display', function(output)
   M.format_display(output)
 end)
-
-return M
