@@ -523,6 +523,10 @@
 ---@field current_files? string[]
 ---@field symbol_cycle? SymbolSnapshotCycle
 
+---@class ToolFormatter
+---@field format fun(output: Output, part: table, context?: FormatterContext, ...: any) Write this tool part's content to the output
+---@field summary? fun(part: table): string, string, string Icon, label, and value for nested tool rows
+
 ---@class OutputTargetRange
 ---@field line integer Output-local line, 1-based
 ---@field start_col integer Output-local column, 0-based inclusive
@@ -591,8 +595,8 @@
 
 ---@class CompletionSource
 ---@field name string Name of the completion source
----@field priority number Priority for ordering sources
----@field complete fun(context: CompletionContext): Promise<CompletionItem[]> Function to generate completion items
+---@field priority? number Priority for ordering sources
+---@field complete fun(context: CompletionContext): Promise<CompletionItem[]>|CompletionItem[] Function to generate completion items
 ---@field on_complete? fun(item: CompletionItem): nil Callback when item is selected
 ---@field is_incomplete? boolean Whether the completion results are incomplete (for sources that support pagination)
 ---@field get_trigger_character? fun(): string|nil Optional function returning the trigger character for this source
