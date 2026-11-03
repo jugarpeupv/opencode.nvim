@@ -7,6 +7,7 @@ local helpers = require('tests.helpers')
 local service_support = require('tests.unit.services_spec_support')
 local ui = require('opencode.ui.ui')
 local question_window = require('opencode.ui.question_window')
+local permission_window = require('opencode.ui.permission_window')
 
 local function expect_nil_hook_no_error(run)
   assert.has_no.errors(run)
@@ -261,6 +262,38 @@ describe('hooks', function()
       end, function()
         state.renderer.set_pending_permissions({ { tool = 'test_tool', action = 'read' } })
       end)
+    end)
+
+    it('notifies once for each new pending permission with its owning session', function()
+      local calls = {}
+      config.hooks.on_permission_requested = function(session)
+        calls[#calls + 1] = session.id
+      end
+      local requests = {
+        first = { id = 'first', status = 'pending', session_id = 'session-a' },
+      }
+      local observation = {
+        read = function()
+          return { session = { id = 'session-a' }, permission_requests_by_id = requests }
+        end,
+      }
+      local setup = stub(permission_window, '_setup_dialog')
+      permission_window.clear_all()
+
+      permission_window.sync({ observation })
+      permission_window.sync({ observation })
+      requests.second = { id = 'second', status = 'pending', session_id = 'session-a' }
+      permission_window.sync({ observation })
+
+      assert.same({ 'session-a', 'session-a' }, calls)
+      requests.first.status = 'answered'
+      permission_window.sync({ observation })
+      requests.first.status = 'pending'
+      permission_window.sync({ observation })
+      assert.same({ 'session-a', 'session-a', 'session-a' }, calls)
+
+      setup:revert()
+      permission_window.clear_all()
     end)
   end)
 
