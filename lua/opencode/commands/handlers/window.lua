@@ -146,6 +146,47 @@ function M.actions.toggle_zoom()
   ui.toggle_zoom()
 end
 
+---Close every regular split except the Opencode input and output windows.
+---Floating windows (footer, tab strip, user popups) stay untouched, matching
+---`:only` semantics for splits.
+function M.actions.only_opencode()
+  local windows = state.windows or {}
+  if windows.position == 'float' or not windows.output_win or not vim.api.nvim_win_is_valid(windows.output_win) then
+    return
+  end
+
+  -- Remember the code buffer before closing its window so a later toggle can
+  -- recreate a code window showing it.
+  local last = state.last_code_win_before_opencode
+  if last and vim.api.nvim_win_is_valid(last) and last ~= windows.output_win and last ~= windows.input_win then
+    local buf = vim.api.nvim_win_get_buf(last)
+    if buf and vim.api.nvim_buf_is_valid(buf) then
+      state.ui.set_current_code_buf(buf)
+    end
+  end
+
+  local keep = {}
+  for _, win in ipairs({ windows.output_win, windows.input_win, windows.footer_win, windows.tab_strip_win }) do
+    if win and vim.api.nvim_win_is_valid(win) then
+      keep[win] = true
+    end
+  end
+
+  for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+    if not keep[win] and vim.api.nvim_win_get_config(win).relative == '' then
+      pcall(vim.api.nvim_win_close, win, true)
+    end
+  end
+
+  -- The previous code window is gone; let the next navigation pick a new one.
+  state.ui.set_last_code_window(nil)
+
+  -- The panel is now the only normal window, i.e. full width. Reopening must
+  -- use the configured default width instead of restoring the full width.
+  state.ui.clear_last_window_width_ratio()
+  state.ui.set_pre_zoom_width(nil)
+end
+
 function M.actions.toggle_input()
   input_window.toggle()
 end
@@ -212,6 +253,10 @@ M.command_defs = {
   toggle_zoom = {
     desc = 'Toggle window zoom',
     execute = M.actions.toggle_zoom,
+  },
+  only_opencode = {
+    desc = 'Close all windows except Opencode input and output',
+    execute = M.actions.only_opencode,
   },
   toggle_input = {
     desc = 'Toggle input window visibility',
