@@ -3,6 +3,7 @@ local config = require('opencode.config')
 local formatter = require('opencode.ui.formatter')
 local reference_facts = require('opencode.ui.reference_facts')
 local symbol_snapshot = require('opencode.ui.symbol_snapshot')
+local turn_tokens = require('opencode.ui.turn_tokens')
 local output_window = require('opencode.ui.output_window')
 local contexts = require('opencode.ui.renderer.ctx')
 local scroll = require('opencode.ui.renderer.scroll')
@@ -279,6 +280,12 @@ local function new_formatter_context(ctx, opts)
     end,
     get_background_tool = function(id)
       return ctx.background_tools[id]
+    end,
+    get_turn_usage = function(message)
+      if not turn_tokens.enabled() then
+        return nil
+      end
+      return message and ctx.turn_usage_by_message[message.id]
     end,
     current_refs = reference_facts.current_refs(),
     current_files = reference_facts.available_files(),

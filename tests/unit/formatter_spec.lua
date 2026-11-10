@@ -84,6 +84,38 @@ describe('formatter', function()
     assert.same({}, formatter.format_part({ kind = 'text', text = 'hidden' }, nil).lines)
   end)
 
+  it('renders turn token usage after the last assistant part', function()
+    local message = assistant({
+      { id = 'prt_turn_text', kind = 'text', text = 'done' },
+    }, {
+      id = 'msg_turn',
+      finish = 'stop',
+      time = { created = 1, completed = 2 },
+      tokens = { input = 100, output = 20, reasoning = 0, cache = { read = 10, write = 5 } },
+    })
+
+    local output = formatter.format_part(message.content[1], message, true, {
+      interactive = false,
+      get_turn_usage = function()
+        return { steps = 2, new_tokens = 7973, cached = 5888, total = 13861 }
+      end,
+    })
+
+    assert.are.equal('done', output.lines[1])
+    assert.is_truthy(
+      table
+        .concat(output.lines, '\n')
+        :find('Tokens: 2 steps · latest: 7,973 new · 5,888 cached · 13,861 total', 1, true)
+    )
+  end)
+
+  it('does not render turn token usage without a turn summary', function()
+    local message = assistant({ { id = 'prt_turn_text', kind = 'text', text = 'done' } })
+    local output = formatter.format_part(message.content[1], message, true)
+
+    assert.is_nil(table.concat(output.lines, '\n'):find('Tokens:', 1, true))
+  end)
+
   it('highlights automatically inserted review-comment references in user prompts', function()
     local prompt = '@review-comment-1 just testing'
     local message = {

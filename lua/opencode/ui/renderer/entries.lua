@@ -1,6 +1,7 @@
 local contexts = require('opencode.ui.renderer.ctx')
 local flush = require('opencode.ui.renderer.flush')
 local buffer = require('opencode.ui.renderer.buffer')
+local turn_tokens = require('opencode.ui.turn_tokens')
 
 local M = {}
 
@@ -43,6 +44,7 @@ end
 ---@param ctx? RendererCtx
 function M.reconcile(visible, references_changed, ctx)
   ctx = ctx or contexts.current()
+  local show_turn_tokens = turn_tokens.enabled()
   local parts_by_message = {}
   for part_id, rendered in pairs(ctx.render_state._parts) do
     local parts = parts_by_message[rendered.message_id] or {}
@@ -77,6 +79,7 @@ function M.reconcile(visible, references_changed, ctx)
           error = entry.error,
           content_kinds = entry.kind == 'user' and ctx.message_snapshots[entry.id].content_kinds or nil,
           last = last_part_id == part_id,
+          turn_usage = show_turn_tokens and last_part_id == part_id and ctx.turn_usage_by_message[entry.id] or nil,
           -- A background job's outcome arrives as a separate entry but renders in its tool part.
           background_result = content.background and ctx.background_results[content.background.id],
           completion = entry.background_result,

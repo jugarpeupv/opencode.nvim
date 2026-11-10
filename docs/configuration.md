@@ -410,6 +410,7 @@ require('opencode').setup({
   },
   debug = {
     enabled = false,
+    turn_tokens = 'auto', -- false, true, 'verbose', or 'auto' (follow cli.json)
     capture_streamed_events = false,
     show_ids = true,
     highlight_changed_lines = false,
@@ -538,6 +539,9 @@ For a more involved layout toggle, see the
 - `ui.output.compact_assistant_headers` accepts `false`/`'full'`,
   `true`/`'minimal'`, or `'hidden'`. Minimal headers collapse repeated agent
   information.
+- `debug.turn_tokens` renders a `Tokens: …` line after each completed response.
+  `true` and `'verbose'` enable it; `'auto'` follows `debug.turn_tokens` from
+  `~/.config/opencode/cli.json`. Set it to `false` to disable the line.
 - `ui.output.max_messages = nil` means no initial limit. With a limit, scrolling
   up, `[[`, or `gg` loads older messages. `<leader>otm` toggles the limit.
 - `ui.output.always_scroll_to_bottom = false` allows reading older output.
