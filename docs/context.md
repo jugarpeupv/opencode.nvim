@@ -79,7 +79,10 @@ The plugin avoids sending the same thing twice in a session:
 ## Attach an image
 
 Press `<leader>ov`, or `<M-v>` in insert mode in the input, to attach the image
-on your clipboard. The model you use has to accept images.
+on your clipboard. The prompt gets
+`@pasted_image_<timestamp>.<ext>` followed by the source path as inline code;
+press `gf` on the mention or the path to open the image. The model you use has
+to accept images.
 
 ## Sensitive files
 

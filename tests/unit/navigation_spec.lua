@@ -511,6 +511,38 @@ describe('output token navigation', function()
     assert.same({ path = existing_path, line = 7, col = 2 }, navigated)
   end)
 
+  it('opens pasted-image paths from the input without a winfixbuf target', function()
+    local dir = vim.fn.tempname()
+    vim.fn.mkdir(dir, 'p')
+    local path = dir .. '/pasted_image_20240101_120000.png'
+    vim.fn.writefile({ 'image' }, path)
+
+    input_buf = vim.api.nvim_create_buf(false, true)
+    input_win = vim.api.nvim_open_win(input_buf, true, {
+      relative = 'editor',
+      width = 40,
+      height = 3,
+      row = 15,
+      col = 0,
+    })
+    vim.api.nvim_set_option_value('winfixbuf', true, { win = input_win })
+    vim.api.nvim_set_option_value('winfixbuf', true, { win = output_win })
+    vim.api.nvim_buf_set_lines(input_buf, 0, -1, false, { '@pasted_image_20240101_120000.png `' .. path .. '`' })
+    state.ui.set_windows({ input_buf = input_buf, input_win = input_win, position = 'right' })
+    -- A stale pointer to the focused opencode window used to make `gf` try to
+    -- switch that winfixbuf buffer and fail with E1513.
+    state.ui.set_last_code_window(input_win)
+
+    local ok, err = pcall(navigation.jump_to_file_at_cursor)
+    local opened = vim.api.nvim_buf_get_name(vim.api.nvim_get_current_buf())
+    vim.api.nvim_buf_delete(vim.api.nvim_get_current_buf(), { force = true })
+    vim.fn.delete(dir, 'rf')
+
+    assert.is_true(ok, tostring(err))
+    assert.is_not_equal(input_win, vim.api.nvim_get_current_win())
+    assert.equals(vim.fn.resolve(path), vim.fn.resolve(opened))
+  end)
+
   it('hides current-mode output before opening a target so output view can be restored', function()
     config.values.ui.position = 'current'
     config.values.ui.persist_state = true
