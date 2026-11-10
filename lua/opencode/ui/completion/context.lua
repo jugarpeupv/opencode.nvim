@@ -260,6 +260,46 @@ end
 
 local custom_kind = require('opencode.ui.completion.kind')
 
+---@return CompletionItem[]
+function M.items()
+  local ctx = context.get_context()
+  local items = {
+    add_current_file_item(ctx),
+    add_diagnostics_item(ctx),
+    add_cursor_data_item(ctx),
+  }
+  vim.list_extend(items, add_selection_items(ctx))
+  vim.list_extend(items, add_review_comment_items(ctx))
+  vim.list_extend(items, add_mentioned_files_items(ctx))
+  vim.list_extend(items, add_subagents_items(ctx))
+  return items
+end
+
+---@param item CompletionItem
+function M.apply(item)
+  if not item or not item.data then
+    return
+  end
+
+  local type = item.data.type
+  if type ~= 'review_comment_item' then
+    context.toggle_context(type)
+  end
+
+  if type == 'mentioned_file' then
+    local file_path = item.data.additional_data and item.data.additional_data.file_path or item.data.name
+    context.remove_file(file_path)
+  elseif type == 'subagent' then
+    local subagent_name = item.data.name:gsub(' %(agent%)$', '')
+    context.remove_subagent(subagent_name)
+    require('opencode.ui.input_window').remove_mention(subagent_name)
+  elseif type == 'selection_item' then
+    context.remove_selection(item.data.additional_data --[[@as OpencodeContextSelection]])
+  elseif type == 'review_comment_item' then
+    context.remove_review_comment(item.data.additional_data)
+  end
+end
+
 ---@type CompletionSource
 local context_source = {
   name = 'context',
@@ -273,18 +313,7 @@ local context_source = {
       return {}
     end
 
-    local ctx = context.get_context()
-
-    local items = {
-      add_current_file_item(ctx),
-      add_diagnostics_item(ctx),
-      add_cursor_data_item(ctx),
-    }
-    vim.list_extend(items, add_selection_items(ctx))
-    vim.list_extend(items, add_review_comment_items(ctx))
-    vim.list_extend(items, add_mentioned_files_items(ctx))
-    vim.list_extend(items, add_subagents_items(ctx))
-
+    local items = M.items()
     if #input > 0 then
       items = vim.tbl_filter(function(item)
         return item.label:lower():find(input:lower(), 1, true) ~= nil
@@ -294,29 +323,10 @@ local context_source = {
     return items
   end),
   on_complete = function(item)
-    local input_win = require('opencode.ui.input_window')
     if not item or not item.data then
       return
     end
-
-    local type = item.data.type
-    if type ~= 'review_comment_item' then
-      context.toggle_context(type)
-    end
-
-    if type == 'mentioned_file' then
-      local file_path = item.data.additional_data and item.data.additional_data.file_path or item.data.name
-      context.remove_file(file_path)
-    elseif type == 'subagent' then
-      local subagent_name = item.data.name:gsub(' %(agent%)$', '')
-      context.remove_subagent(subagent_name)
-      input_win.remove_mention(subagent_name)
-    elseif type == 'selection_item' then
-      context.remove_selection(item.data.additional_data --[[@as OpencodeContextSelection]])
-    elseif type == 'review_comment_item' then
-      context.remove_review_comment(item.data.additional_data)
-    end
-
+    M.apply(item)
     vim.schedule(function()
       remove_inserted_text(item)
     end)
