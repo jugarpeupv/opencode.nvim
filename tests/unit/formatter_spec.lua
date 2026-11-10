@@ -105,6 +105,30 @@ describe('formatter', function()
     assert.equals(#'@review-comment-1', mention_mark.end_col)
   end)
 
+  it('adds file targets for pasted-image source paths in user prompts', function()
+    local dir = vim.fn.tempname()
+    vim.fn.mkdir(dir, 'p')
+    local path = dir .. '/pasted_image_20240101_120000.png'
+    vim.fn.writefile({ 'image' }, path)
+    local prompt = '@pasted_image_20240101_120000.png `' .. path .. '` inspect'
+    local message = {
+      id = 'msg_pasted_image',
+      kind = 'user',
+      content = { { kind = 'text', text = prompt } },
+    }
+
+    local output = formatter.format_part(message.content[1], message, true)
+    local targeted = 0
+    for _, target in ipairs(output.targets) do
+      if target.kind == 'file' and target.path == path then
+        targeted = targeted + 1
+      end
+    end
+
+    vim.fn.delete(dir, 'rf')
+    assert.equals(2, targeted)
+  end)
+
   it('preserves replacement output and actions for system display parts', function()
     local output = formatter.format_part({ kind = 'hidden_messages_display', hidden_count = 2 }, { kind = 'system' })
     assert.equals('> 2 older messages are not displayed.', output.lines[1])

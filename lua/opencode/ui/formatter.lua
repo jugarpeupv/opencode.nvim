@@ -379,6 +379,54 @@ function M._format_callout(output, callout, text, title)
   end
 end
 
+---Pasted images keep only their basename in the message file part, so the
+---prompt text also carries the source path (as inline code, or parenthesized
+---by older versions). Register it as a file target so `gf`/`jump_to_file` can
+---reopen the image from the rendered prompt.
+---@param line string
+---@param mention_end integer 1-based end of the mention
+---@return string? path
+---@return integer? open 1-based delimiter start
+---@return integer? close 1-based delimiter end
+local function pasted_image_source(line, mention_end)
+  local delimiters = { { '`', '`' }, { '(', ')' } }
+  for _, delimiter in ipairs(delimiters) do
+    local open = line:find(delimiter[1], mention_end, true)
+    local close = open and line:find(delimiter[2], open + 1, true)
+    if open and close and close > open + 1 then
+      local path = vim.fn.expand(line:sub(open + 1, close - 1))
+      if path ~= '' and vim.fn.filereadable(path) == 1 then
+        return path, open, close
+      end
+    end
+  end
+end
+
+---@param output Output
+---@param text string
+---@param start_line integer
+local function add_pasted_image_targets(output, text, start_line)
+  for index, line in ipairs(vim.split(text, '\n')) do
+    local mention_start, mention_end = line:find('@pasted_image_[%w_%-%.]+')
+    if mention_start then
+      local path, open, close = pasted_image_source(line, mention_end)
+      if path and open and close then
+        local output_line = start_line + index
+        output:add_target({
+          kind = 'file',
+          path = path,
+          range = { line = output_line, start_col = mention_start - 1, end_col = mention_end },
+        })
+        output:add_target({
+          kind = 'file',
+          path = path,
+          range = { line = output_line, start_col = open - 1, end_col = close },
+        })
+      end
+    end
+  end
+end
+
 ---@param output Output Output object to write to
 ---@param text string
 ---@param message? table Optional message object to extract mentions from
@@ -386,6 +434,7 @@ function M._format_user_prompt(output, text, message)
   local start_line = output:get_line_count()
 
   output:add_lines(vim.split(text, '\n'))
+  add_pasted_image_targets(output, text, start_line)
 
   local end_line = output:get_line_count()
 

@@ -265,7 +265,9 @@ describe('image_handler', function()
     mention.mention = original_mention
 
     assert.is_true(ok, tostring(err))
-    assert.same({ 'pasted_image_20240101_120000.png' }, names)
+    assert.same({
+      'pasted_image_20240101_120000.png `/tmp/test_dir/pasted_image_20240101_120000.png`',
+    }, names)
     assert.same({ path }, mocks.added_files)
     assert.same({
       {

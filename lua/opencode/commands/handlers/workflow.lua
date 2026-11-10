@@ -237,8 +237,12 @@ function M.actions.paste_image()
   end
 
   local name = vim.fn.fnamemodify(image_path, ':t')
+  -- Keep the basename mention for the model/context, then append the real
+  -- on-disk path as inline code so `gf` can reach the image (the file part
+  -- only carries the basename). `:~` keeps it shorter under $HOME.
+  local source_path = vim.fn.fnamemodify(image_path, ':~')
   require('opencode.ui.mention').mention(function(mention_cb)
-    mention_cb(name)
+    mention_cb(name .. ' `' .. source_path .. '`')
     require('opencode.context').add_file(image_path)
   end)
   vim.notify('Image saved and added to context: ' .. name, vim.log.levels.INFO)

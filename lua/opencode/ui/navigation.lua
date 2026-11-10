@@ -218,14 +218,53 @@ local function open_at(win, path, line, col)
 end
 
 local function best_target_win()
+  local function usable(win)
+    if not win or not vim.api.nvim_win_is_valid(win) then
+      return false
+    end
+    local windows = state.windows or {}
+    if
+      win == windows.input_win
+      or win == windows.output_win
+      or win == windows.footer_win
+      or win == windows.tab_strip_win
+    then
+      return false
+    end
+    -- Opening another buffer in a 'winfixbuf' window fails with E1513.
+    return not vim.api.nvim_get_option_value('winfixbuf', { win = win })
+  end
+
   local w = state.last_code_win_before_opencode
-  if w and vim.api.nvim_win_is_valid(w) then
+  if usable(w) then
     return w
   end
   local alt = vim.fn.win_getid(vim.fn.winnr('#'))
-  if alt ~= 0 and vim.api.nvim_win_is_valid(alt) then
+  if usable(alt) then
     return alt
   end
+  for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+    if usable(win) then
+      return win
+    end
+  end
+end
+
+---Open a path in a new tab when no regular code window can take it.
+---Splitting the focused window is unsafe here: the opencode windows set
+---'winfixbuf', so opening a different buffer there fails with E1513.
+---@param path string
+---@param line? number
+---@param col? number
+---@return boolean
+function M.open_in_new_window(path, line, col)
+  local ok = pcall(vim.cmd, 'tabnew')
+  if not ok then
+    return false
+  end
+  local win = vim.api.nvim_get_current_win()
+  pcall(vim.api.nvim_set_option_value, 'winfixbuf', false, { win = win })
+  return open_at(win, path, line, col)
 end
 
 ---@param path string
@@ -237,12 +276,15 @@ function M.navigate_to_location(path, line, col)
   if not resolved_path then
     return false
   end
-  local target_win = best_target_win()
   local windows = state.windows
-  if windows and windows.position == 'current' and target_win == windows.output_win then
+  if windows and windows.position == 'current' and windows.output_win then
     require('opencode.ui.ui').hide_visible_windows(windows)
   end
-  return open_at(target_win, resolved_path, line, col)
+  local target_win = best_target_win()
+  if target_win then
+    return open_at(target_win, resolved_path, line, col)
+  end
+  return M.open_in_new_window(resolved_path, line, col)
 end
 
 function M.resolve_target_at_cursor()
@@ -353,7 +395,45 @@ function M.jump_to_target_at_cursor()
   end
 end
 
+---@return string|nil
+local function input_path_at_cursor()
+  local win = vim.api.nvim_get_current_win()
+  local buf = vim.api.nvim_win_get_buf(win)
+  local cursor = vim.api.nvim_win_get_cursor(win)
+  local line = vim.api.nvim_buf_get_lines(buf, cursor[1] - 1, cursor[1], false)[1] or ''
+
+  local mention_start, mention_end = line:find('@pasted_image_[%w_%-%.]+')
+  if mention_start then
+    local delimiters = { { '`', '`' }, { '(', ')' } }
+    for _, delimiter in ipairs(delimiters) do
+      local open = line:find(delimiter[1], mention_end, true)
+      local close = open and line:find(delimiter[2], open + 1, true)
+      if open and close and close > open + 1 then
+        local path = vim.fn.expand(line:sub(open + 1, close - 1))
+        if vim.fn.filereadable(path) == 1 then
+          return path
+        end
+      end
+    end
+    return require('opencode.image_handler').restore_img_path(line:sub(mention_start + 1, mention_end))
+  end
+
+  local cfile = vim.fn.expand('<cfile>')
+  if cfile ~= '' and cfile ~= line then
+    return vim.fn.expand(cfile)
+  end
+end
+
 function M.jump_to_file_at_cursor()
+  local windows = state.windows or {}
+  if windows.input_win and vim.api.nvim_get_current_win() == windows.input_win then
+    local path = input_path_at_cursor()
+    if path then
+      M.navigate_to_location(path)
+    end
+    return
+  end
+
   local target = target_at_cursor(function(candidate)
     return candidate.kind == 'file' or candidate.kind == 'diff'
   end)

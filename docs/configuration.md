@@ -194,6 +194,7 @@ require('opencode').setup({
       ['<M-m>']  =      { 'switch_mode',                  mode = { 'n', 'i' }, desc = 'Switch agent mode'                                        },
       ['<M-r>']  =      { 'cycle_variant',                mode = { 'n', 'i' }, desc = 'Cycle model variants'                                     },
       ['<M-i>']  =      { 'toggle_input',                 mode = { 'n', 'i' }, desc = 'Toggle input window'                                      },
+      ['gf']     =      { 'jump_to_file',                                      desc = 'Jump to file at cursor'                                   },
       ['gr']     =      { 'references',                                        desc = 'Browse code references'                                   },
       ['<leader>oS'] =  { 'navigate_session_tree', { 'child', 'picker' },     desc = 'Select child session' },
       ['<leader>oP'] =  { 'navigate_session_tree', { 'parent' },              desc = 'Go to parent session' },
