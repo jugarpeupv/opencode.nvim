@@ -28,6 +28,7 @@ local action_groups = {
   window = {
     swap_position = window.swap_position,
     toggle_zoom = window.toggle_zoom,
+    only_opencode = window.only_opencode,
     toggle_input = window.toggle_input,
     open_input = window.open_input,
     open_output = window.open_output,

@@ -84,6 +84,23 @@ local function capture_hidden_snapshot(windows)
   }
 end
 
+---@param windows? OpencodeWindowState
+---@return integer?
+local function find_normal_window(windows)
+  windows = windows or state.windows or {}
+  for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+    if
+      win ~= windows.input_win
+      and win ~= windows.output_win
+      and win ~= windows.footer_win
+      and win ~= windows.tab_strip_win
+      and vim.api.nvim_win_get_config(win).relative == ''
+    then
+      return win
+    end
+  end
+end
+
 ---@param windows OpencodeWindowState?
 ---@param persist? boolean If true, preserve buffers for fast restore
 function M.close_windows(windows, persist)
@@ -160,9 +177,16 @@ function M.hide_visible_windows(windows, force_preserve)
 
   -- Only save width ratio for split modes (not dialog/current mode)
   if windows.position ~= 'current' then
-    local total_cols = vim.o.columns
-    local current_width = vim.api.nvim_win_get_width(windows.output_win)
-    state.ui.set_last_window_width_ratio(current_width / total_cols)
+    if find_normal_window(windows) then
+      local total_cols = vim.o.columns
+      local current_width = vim.api.nvim_win_get_width(windows.output_win)
+      state.ui.set_last_window_width_ratio(current_width / total_cols)
+    else
+      -- The panel is the only normal window (for example after only_opencode
+      -- closed the code splits). Reopen at the configured default width.
+      state.ui.clear_last_window_width_ratio()
+      state.ui.set_pre_zoom_width(nil)
+    end
   end
 
   state.ui.clear_hidden_window_state()
@@ -344,11 +368,43 @@ function M.has_hidden_buffers()
   return state.ui.has_hidden_buffers()
 end
 
+---@return integer?
+local function recreate_code_window()
+  local buf = state.current_code_buf
+  if not buf or not vim.api.nvim_buf_is_valid(buf) then
+    return nil
+  end
+  local windows = state.windows or {}
+  if windows.position == 'current' then
+    return nil
+  end
+  local vertical = windows.position ~= 'top' and windows.position ~= 'bottom'
+  if not pcall(vim.cmd, vertical and 'vsplit' or 'split') then
+    return nil
+  end
+  local win = vim.api.nvim_get_current_win()
+  pcall(vim.api.nvim_set_option_value, 'winfixbuf', false, { win = win })
+  if not pcall(vim.api.nvim_win_set_buf, win, buf) then
+    return nil
+  end
+  state.ui.set_last_code_window(win)
+  return win
+end
+
 ---Return focus to the window that was active before opening Opencode.
+---Recreates a code window when only the panel remains (for example after
+---only_opencode closed the code splits).
 function M.return_to_last_code_win()
   local last_win = state.last_code_win_before_opencode
   if last_win and vim.api.nvim_win_is_valid(last_win) then
     vim.api.nvim_set_current_win(last_win)
+    return
+  end
+
+  local win = find_normal_window() or recreate_code_window()
+  if win then
+    state.ui.set_last_code_window(win)
+    vim.api.nvim_set_current_win(win)
   end
 end
 

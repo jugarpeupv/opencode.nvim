@@ -29,12 +29,15 @@ exist yet when the call returns. See
 | `:Opencode close` | `api.close()` | `<leader>oq` |
 | `:Opencode swap` | `api.swap_position()` | `<leader>ox` |
 | `:Opencode toggle_zoom` | `api.toggle_zoom()` | `<leader>oz` |
+| `:Opencode only_opencode` | `api.only_opencode()` | `<C-w>o` / `<C-w><C-o>` in panel |
 | `:Opencode cancel` | `api.cancel()` | `<C-c>` in panel |
 | `:Opencode references` | `api.references()` | `gr` in panel |
 | `:Opencode jump_to_file` | `api.jump_to_file()` | `gf` in output |
 | `:Opencode history` | `api.select_history()` | `<leader>oh` |
 
 `api.hide()` follows `ui.persist_state`, like `close()`.
+`api.only_opencode()` remembers the last code buffer; the next toggle
+restores it and reopens the panel at the configured default width.
 `api.navigate_to_location(path, line, col)` opens a specific file location.
 `api.next_message()`, `prev_message()`, `next_user_message()`, and
 `prev_user_message()` navigate output; `prev_history()` / `next_history()`
@@ -217,6 +220,7 @@ Every registered `:Opencode` command, including the aliases keymaps use.
 | `:Opencode next_prompt_history` | Navigate to next prompt history item | — |
 | `:Opencode next_session_tab` | Switch to the next Opencode panel tab | — |
 | `:Opencode next_user_message` | Navigate to next user message in output window | — |
+| `:Opencode only_opencode` | Close all windows except Opencode input and output | — |
 | `:Opencode open` | Open opencode window (input/output) | `input`, `output` |
 | `:Opencode open_input` | Open input window | — |
 | `:Opencode open_input_new_session` | Open input (new session) | — |
