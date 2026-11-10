@@ -1,4 +1,5 @@
 local RenderState = require('opencode.ui.render_state')
+local turn_tokens = require('opencode.ui.turn_tokens')
 
 local M = {}
 local current
@@ -25,6 +26,7 @@ M.prompt_controllers = {}
 ---@field render_session? OpencodeRenderSession
 ---@field render_state RenderState
 ---@field entries table[]
+---@field turn_usage_by_message table<string, OpencodeTurnTokensUsage>
 ---@field background_results table<string, OpencodeV2BackgroundResult>
 ---@field background_tools table<string, table>
 ---@field generation integer
@@ -136,6 +138,7 @@ function ctx:reset()
   self.global_folds = {}
   self.part_folds = {}
   self.entries = {}
+  self.turn_usage_by_message = {}
   self.background_results = {}
   self.background_tools = {}
   self.history_expanded = false
@@ -150,6 +153,7 @@ end
 ---@param entries table[]
 function ctx:set_entries(entries)
   self.entries = entries
+  self.turn_usage_by_message = turn_tokens.build(entries)
   self.background_results = {}
   self.background_tools = {}
   for _, entry in ipairs(entries) do

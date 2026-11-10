@@ -392,6 +392,7 @@ M.defaults = {
   },
   debug = {
     enabled = false,
+    turn_tokens = 'auto', -- false, true, 'verbose', or 'auto' (follow cli.json)
     capture_streamed_events = false,
     show_ids = true,
     highlight_changed_lines = false,

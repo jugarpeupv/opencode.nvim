@@ -35,6 +35,10 @@ vim.opt.shadafile = 'NONE'
 
 require('opencode')
 
+-- Keep turn-token rendering off in tests so a developer's cli.json cannot
+-- change buffer assertions. Individual tests opt in explicitly.
+require('opencode.config').debug.turn_tokens = false
+
 -- Safely stub out treesitter during tests, using pcall(require, ...) so tests pass even if vim.treesitter is unavailable.
 local ok, ts = pcall(require, 'vim.treesitter')
 if ok and ts and ts.start then

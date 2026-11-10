@@ -10,7 +10,7 @@ local spy = require('luassert.spy')
 local optimistic = require('opencode.state.optimistic')
 
 describe('renderer incremental reconciliation', function()
-  local observed, observation, changed, controllers, writes, markdown, dirty_part, dirty_message, max_messages, throttle_ms, collapsing, defer_stub, files_stub
+  local observed, observation, changed, controllers, writes, markdown, dirty_part, dirty_message, max_messages, throttle_ms, collapsing, defer_stub, files_stub, turn_tokens_setting
   local schedule_stub
 
   local function notify(resource)
@@ -28,6 +28,7 @@ describe('renderer incremental reconciliation', function()
     helpers.replay_setup()
     max_messages = config.ui.output.max_messages
     config.ui.output.max_messages = nil
+    turn_tokens_setting = config.debug.turn_tokens
     throttle_ms = config.ui.output.rendering.event_throttle_ms
     collapsing = config.ui.output.rendering.event_collapsing
     controllers = contexts.current().prompt_controllers
@@ -98,6 +99,7 @@ describe('renderer incremental reconciliation', function()
     config.ui.output.max_messages = max_messages
     config.ui.output.rendering.event_throttle_ms = throttle_ms
     config.ui.output.rendering.event_collapsing = collapsing
+    config.debug.turn_tokens = turn_tokens_setting
     if defer_stub then
       defer_stub:revert()
       defer_stub = nil
@@ -640,6 +642,101 @@ describe('renderer incremental reconciliation', function()
     assert.is_not_nil(contexts.current().render_state:get_message('msg_one'))
     assert.is_not_nil(contexts.current().render_state:get_part('part_1'))
     assert.stub(writes).was_called(2)
+  end)
+
+  it('renders turn token usage after the last completed assistant step', function()
+    config.debug.turn_tokens = 'verbose'
+    writes:revert()
+    writes = spy.on(output_window, 'set_lines')
+
+    local function assistant_entry(id, text, token_usage)
+      return {
+        id = id,
+        session_id = observed.session.id,
+        kind = 'assistant',
+        agent = 'build',
+        finish = 'stop',
+        time = { created = 1, completed = 2 },
+        content = { { id = id .. '_text', kind = 'text', text = text } },
+        tokens = token_usage,
+      }
+    end
+
+    observed.entry_order = { 'msg_prompt', 'msg_one', 'msg_two' }
+    observed.entries_by_id = {
+      msg_prompt = {
+        id = 'msg_prompt',
+        session_id = observed.session.id,
+        kind = 'user',
+        content = { { id = 'msg_prompt_text', kind = 'text', text = 'prompt' } },
+      },
+      msg_one = assistant_entry('msg_one', 'first response', {
+        input = 100,
+        output = 20,
+        reasoning = 0,
+        cache = { read = 10, write = 5 },
+      }),
+      msg_two = assistant_entry('msg_two', 'second response', {
+        input = 200,
+        output = 30,
+        reasoning = 0,
+        cache = { read = 50, write = 5 },
+      }),
+    }
+
+    notify('messages')
+    local buf = state.windows.output_buf
+    local function output()
+      return table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), '\n')
+    end
+
+    local text = output()
+    assert.is_truthy(text:find('Tokens: 2 steps · latest: 235 new · 50 cached · 285 total', 1, true))
+    local _, count = text:gsub('Tokens:', '')
+    assert.equals(1, count)
+
+    local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+    local footer_at, second_at
+    for index, line in ipairs(lines) do
+      if line:find('Tokens:', 1, true) then
+        footer_at = index
+      end
+      if line:find('second response', 1, true) then
+        second_at = index
+      end
+    end
+    assert.is_true(footer_at > second_at)
+
+    observed.entry_order[#observed.entry_order + 1] = 'msg_three'
+    observed.entries_by_id.msg_three = assistant_entry('msg_three', 'third response', {
+      input = 300,
+      output = 40,
+      reasoning = 0,
+      cache = { read = 100, write = 0 },
+    })
+
+    notify('messages')
+    text = output()
+    assert.is_truthy(text:find('Tokens: 3 steps · latest: 340 new · 100 cached · 440 total', 1, true))
+    local _, after_count = text:gsub('Tokens:', '')
+    assert.equals(1, after_count)
+
+    lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+    footer_at, second_at = nil, nil
+    local third_at
+    for index, line in ipairs(lines) do
+      if line:find('Tokens:', 1, true) then
+        footer_at = index
+      end
+      if line:find('second response', 1, true) then
+        second_at = index
+      end
+      if line:find('third response', 1, true) then
+        third_at = index
+      end
+    end
+    assert.is_true(footer_at > third_at)
+    assert.is_true(footer_at > second_at)
   end)
 
   it('keeps cached message comparisons when selecting another context and returning', function()

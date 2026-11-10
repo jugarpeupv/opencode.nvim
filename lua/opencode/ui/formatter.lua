@@ -9,6 +9,7 @@ local system_formatters = require('opencode.ui.formatter.system')
 local symbol_tokens = require('opencode.ui.symbol_tokens')
 local tool_formatters = require('opencode.ui.formatter.tool_registry')
 local format_utils = require('opencode.ui.formatter.utils')
+local turn_tokens = require('opencode.ui.turn_tokens')
 
 local M = {}
 
@@ -1292,6 +1293,19 @@ local part_formatters = {
   ['location-switched'] = format_location_part,
 }
 
+---@param output Output
+---@param usage OpencodeTurnTokensUsage
+local function format_turn_usage(output, usage)
+  output:add_empty_line()
+  local text = turn_tokens.format(usage)
+  local line = output:add_line(text)
+  output:add_extmark(line - 1, {
+    start_col = 0,
+    end_col = #text,
+    hl_group = 'OpencodeHint',
+  } --[[@as OutputExtmark]])
+end
+
 ---Formats a single message part and returns the resulting output object
 ---@param part table
 ---@param message? table
@@ -1311,6 +1325,11 @@ function M.format_part(part, message, is_last_part, context)
   local formatter = part_formatters[message.kind]
   if formatter then
     output, content_added = formatter(output, part, message, context)
+  end
+
+  local turn_usage
+  if is_last_part and message.kind == 'assistant' and context and context.get_turn_usage then
+    turn_usage = context.get_turn_usage(message)
   end
 
   if message.kind == 'assistant' then
@@ -1333,6 +1352,11 @@ function M.format_part(part, message, is_last_part, context)
   if is_last_part and message.kind == 'assistant' and message.error then
     local error_message = message.error.message or message.error.type or vim.inspect(message.error)
     M._format_callout(output, 'ERROR', error_message)
+    output:add_empty_line()
+  end
+
+  if turn_usage then
+    format_turn_usage(output, turn_usage)
     output:add_empty_line()
   end
 

@@ -365,8 +365,22 @@
 ---| 'buffer'
 ---| 'git_diff'
 
+---@alias OpencodeTurnTokensConfig boolean|'verbose'|'auto'
+
+---@class OpencodeTurnTokensStep
+---@field new_tokens number
+---@field cached number
+---@field total number
+
+---@class OpencodeTurnTokensUsage
+---@field steps integer
+---@field new_tokens number
+---@field cached number
+---@field total number
+
 ---@class OpencodeDebugConfig
 ---@field enabled boolean
+---@field turn_tokens OpencodeTurnTokensConfig
 ---@field capture_streamed_events boolean
 ---@field show_ids boolean
 ---@field highlight_changed_lines boolean
@@ -522,6 +536,7 @@
 ---@field current_refs? CodeReference[]
 ---@field current_files? string[]
 ---@field symbol_cycle? SymbolSnapshotCycle
+---@field get_turn_usage? fun(message: table): OpencodeTurnTokensUsage?
 
 ---@class ToolFormatter
 ---@field format fun(output: Output, part: table, context?: FormatterContext, ...: any) Write this tool part's content to the output
