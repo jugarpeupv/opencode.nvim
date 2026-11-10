@@ -392,4 +392,33 @@ describe('opencode.commands.handlers.workflow', function()
       get_key:revert()
     end)
   end)
+
+  describe('context_items', function()
+    it('opens the context picker and applies the selected item', function()
+      local base_picker = require('opencode.ui.base_picker')
+      local source = require('opencode.ui.completion.context')
+      local items = {
+        { label = 'Current File', detail = 'Current File', data = { type = 'current_file' } },
+      }
+      local items_stub = stub(source, 'items').returns(items)
+      local apply_stub = stub(source, 'apply')
+      local picked
+      local pick_stub = stub(base_picker, 'pick').invokes(function(opts)
+        picked = opts
+        opts.callback(items[1])
+        return true
+      end)
+
+      workflow.actions.context_items()
+
+      items_stub:revert()
+      apply_stub:revert()
+      pick_stub:revert()
+
+      assert.is_not_nil(picked)
+      assert.equals('Context Items', picked.title)
+      assert.same(items, picked.items)
+      assert.stub(apply_stub).was_called_with(items[1])
+    end)
+  end)
 end)

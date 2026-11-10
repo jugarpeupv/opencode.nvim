@@ -354,10 +354,52 @@ local function trigger_input_key(key_fn)
   nvim.nvim_feedkeys(nvim.nvim_replace_termcodes(char, true, false, true), 'n', false)
 end
 
-for _, action_name in ipairs({ 'mention', 'context_items', 'slash_commands' }) do
+for _, action_name in ipairs({ 'mention', 'slash_commands' }) do
   M.actions[action_name] = function()
     trigger_input_key(action_name)
   end
+end
+
+function M.actions.context_items()
+  -- Keep the insert-mode trigger working as before (it inserts `#` and lets
+  -- completion filter inline); normal-mode invocations open the picker
+  -- directly instead of typing a literal trigger into the prompt.
+  if vim.fn.mode():match('^[iR]') then
+    trigger_input_key('context_items')
+    return
+  end
+
+  local picker = require('opencode.ui.base_picker')
+  local source = require('opencode.ui.completion.context')
+  local items = source.items()
+  if #items == 0 then
+    vim.notify('No context items available.', vim.log.levels.INFO)
+    return
+  end
+
+  picker.pick({
+    items = items,
+    format_fn = function(item, width)
+      local text = (item.kind_icon and (item.kind_icon .. ' ') or '') .. item.label
+      if item.detail and item.detail ~= item.label then
+        text = text .. '  ' .. item.detail
+      end
+      return picker.create_time_picker_item(text, nil, nil, width)
+    end,
+    actions = {},
+    callback = function(item)
+      if item then
+        source.apply(item)
+      end
+    end,
+    title = 'Context Items',
+    width = config.ui.picker_width or nil,
+    layout_opts = config.ui.picker,
+    preview = 'custom',
+    preview_fn = function(item, target)
+      target:set_lines(vim.split(item.documentation or item.label or '', '\n'))
+    end,
+  })
 end
 
 function M.actions.mention_file()
