@@ -727,6 +727,44 @@ describe('session diff', function()
     assert.matches('b.lua', line)
   end)
 
+  it('keeps the preview file while moving with j and k in the list', function()
+    local cwd = vim.fn.getcwd()
+    diff.open({
+      file(cwd .. '/a.lua', '@@ -1 +1 @@\n-old-a\n+new-a'),
+      file(cwd .. '/b.lua', '@@ -1 +1 @@\n-old-b\n+new-b'),
+    }, { id = 'ses_jk_nav' })
+
+    local list_win = vim.api.nvim_get_current_win()
+    local list_buf = vim.api.nvim_win_get_buf(list_win)
+    local function preview_text()
+      local texts = {}
+      for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+        if win ~= list_win then
+          texts[#texts + 1] =
+            table.concat(vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(win), 0, -1, false), '\n')
+        end
+      end
+      return table.concat(texts, '\n')
+    end
+
+    vim.api.nvim_win_set_cursor(list_win, { 2, 0 })
+    vim.api.nvim_exec_autocmds('CursorMoved', { buffer = list_buf })
+    assert.is_truthy(preview_text():find('new%-a'))
+
+    vim.cmd('normal! j')
+    assert.same({ 3, 0 }, vim.api.nvim_win_get_cursor(list_win))
+    assert.is_truthy(preview_text():find('new%-a'))
+    assert.is_nil(preview_text():find('new%-b'))
+
+    vim.cmd('normal! k')
+    assert.same({ 2, 0 }, vim.api.nvim_win_get_cursor(list_win))
+    assert.is_truthy(preview_text():find('new%-a'))
+
+    vim.api.nvim_win_set_cursor(list_win, { 3, 0 })
+    diff.activate()
+    assert.is_truthy(preview_text():find('new%-b'))
+  end)
+
   it('opens side-by-side, navigates tree files, and returns to patch', function()
     local original_tab = vim.api.nvim_get_current_tabpage()
     local cwd = vim.fn.getcwd()

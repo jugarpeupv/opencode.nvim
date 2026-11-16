@@ -18,6 +18,9 @@ In the file list, `<CR>` opens a file or folds a directory. `<Tab>` and
 `<S-Tab>` go to the next and previous file from either the list or the preview.
 Press `p` to switch between side by side and a unified patch.
 
+`j` / `k` move the list cursor without changing the preview. Press `<CR>` on a
+file row to preview that file.
+
 ![Unified patch preview](https://github.com/user-attachments/assets/f014f4b5-f672-4878-a581-0856894a7cb6)
 
 Both sides come from snapshots OpenCode recorded during the session. If you

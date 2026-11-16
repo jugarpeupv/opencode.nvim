@@ -1081,11 +1081,6 @@ function M.open(files, session, options)
         end
         return
       end
-      local node = view.rows[row]
-      if node and node.file_index and node.file_index ~= view.index then
-        view.index = node.file_index
-        update()
-      end
     end,
   })
   if #files > 0 then
