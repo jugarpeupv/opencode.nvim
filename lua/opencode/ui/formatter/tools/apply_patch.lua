@@ -52,7 +52,8 @@ function M.format(output, part, context, _, message)
       context,
       file.path,
       action_line - 1,
-      output:get_line_count() - 1
+      output:get_line_count() - 1,
+      file.diff
     )
   end
 end

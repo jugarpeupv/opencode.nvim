@@ -104,10 +104,9 @@ function M.format(output, part, context, _, message)
       range = { line = action_line, start_col = 0, end_col = end_col },
     })
 
+    local diff = file.diff or unified_diff(file)
     if config.ui.output.tools.show_output or config.ui.output.tools.use_folds then
-      local diff = file.diff or unified_diff(file)
       if diff then
-        ---@cast diff string
         local start_line = output:get_line_count() + 1
         formatter_utils.format_diff(output, diff, util.get_markdown_language(file.path), file.path)
         output:add_fold_with_threshold(start_line, config.ui.output.tools.show_output, config.ui.output.tools.use_folds)
@@ -119,7 +118,8 @@ function M.format(output, part, context, _, message)
       context,
       file.path,
       action_line - 1,
-      output:get_line_count() - 1
+      output:get_line_count() - 1,
+      diff
     )
   end
 end

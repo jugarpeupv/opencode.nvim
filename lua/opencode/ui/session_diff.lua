@@ -25,6 +25,22 @@ local function file_icon(name)
   return vim.trim(icons.get('file')), nil
 end
 
+---Resolve a diff path against the session directory and canonicalize symlinks.
+---@param path string
+---@param session? {location?: {directory?: string}}
+---@return string
+local function normalize_path(path, session)
+  path = util.apply_reverse_path_map(path)
+  local is_absolute = path:sub(1, 1) == '/' or path:match('^%a:[/\\]') ~= nil
+  if not is_absolute then
+    local base = session and session.location and session.location.directory
+    if base then
+      path = vim.fs.joinpath(base, path)
+    end
+  end
+  return vim.fn.resolve(vim.fn.fnamemodify(path, ':p'))
+end
+
 ---@class OpencodeSessionDiffView
 ---@field tab integer
 ---@field list_win integer
@@ -41,7 +57,7 @@ end
 ---@field list_buf integer
 ---@field tree OpencodeSessionDiffNode
 ---@field rows OpencodeSessionDiffNode[]
----@field session {id: string, title?: string}
+---@field session {id: string, title?: string, location?: {directory?: string}}
 ---@field range_mode boolean
 ---@field turns {id: string, text: string, created?: number}[]
 ---@field message_count? integer
@@ -415,6 +431,21 @@ local function refresh_comments()
   render.title(view)
 end
 
+---@param file OpencodeV2FileDiff
+---@param session? {location?: {directory?: string}}
+---@return string[]?, string[]?
+local function sides_for_file(file, session)
+  local before, after = patch.sides(file.patch)
+  if before then
+    return before, after
+  end
+  local path = normalize_path(file.file, session)
+  if vim.fn.filereadable(path) == 1 then
+    return patch.sides_from_file(file.patch, vim.fn.readfile(path))
+  end
+  return nil, nil
+end
+
 ---@param win integer
 ---@param first integer
 ---@param last integer
@@ -631,7 +662,7 @@ local function update()
   local filetype = vim.filetype.match({ filename = file.file }) or vim.fn.fnamemodify(file.file, ':e')
   view.patch_map = patch.line_map(file.patch)
   view.patch_lines = vim.split(file.patch, '\n', { plain = true, trimempty = true })
-  view.before_lines, view.after_lines = patch.sides(file.patch)
+  view.before_lines, view.after_lines = sides_for_file(file, view.session)
   if view.mode == 'sides' then
     local before, after = view.before_lines, view.after_lines
     if not before then
@@ -686,8 +717,8 @@ function M.show_sides()
   if not in_view() or view.mode == 'sides' or #view.files == 0 then
     return
   end
-  local file = assert(view.files[view.index])
-  if not patch.sides(file.patch) then
+  update()
+  if not view.before_lines then
     vim.notify('Side-by-side unavailable for this patch.', vim.log.levels.WARN)
     return
   end
@@ -729,10 +760,9 @@ function M.activate()
   end
   if node.file_index then
     view.index = node.file_index
-    if view.mode == 'patch' then
+    update()
+    if view.mode == 'patch' and view.before_lines then
       M.show_sides()
-    else
-      update()
     end
     return
   end
@@ -831,6 +861,57 @@ function M.select(direction)
   return true
 end
 
+---@param files OpencodeV2FileDiff[]
+---@param path string
+---@param session? {location?: {directory?: string}}
+---@return boolean
+function M.has_file(files, path, session)
+  local target = normalize_path(path, session)
+  for _, file in ipairs(files) do
+    if normalize_path(file.file, session) == target then
+      return true
+    end
+  end
+  return false
+end
+
+---Build a session-diff entry from a tool call patch so files outside the
+---session turn diff can still open in the review panel.
+---@param path string
+---@param patch string
+---@return OpencodeV2FileDiff
+function M.file_from_patch(path, patch)
+  local additions, deletions = 0, 0
+  local added_file = patch:find('new file mode', 1, true) ~= nil
+  local deleted_file = patch:find('deleted file mode', 1, true) ~= nil
+  for _, line in ipairs(vim.split(patch:gsub('\r\n', '\n'), '\n', { plain = true })) do
+    if line:sub(1, 4) == '+++ ' then
+      deleted_file = deleted_file or line:find('/dev/null', 1, true) ~= nil
+    elseif line:sub(1, 4) == '--- ' then
+      added_file = added_file or line:find('/dev/null', 1, true) ~= nil
+    elseif line:sub(1, 1) == '+' then
+      additions = additions + 1
+    elseif line:sub(1, 1) == '-' then
+      deletions = deletions + 1
+    end
+  end
+
+  local status = 'modified'
+  if added_file then
+    status = 'added'
+  elseif deleted_file then
+    status = 'deleted'
+  end
+
+  return {
+    file = path,
+    patch = patch,
+    additions = additions,
+    deletions = deletions,
+    status = status,
+  }
+end
+
 ---@param path string
 ---@param from string
 ---@param session_id string
@@ -839,9 +920,9 @@ function M.toggle_file(path, from, session_id)
   if not active() or view.session.id ~= session_id or view.from ~= from then
     return false
   end
-  local target = vim.fn.fnamemodify(util.apply_reverse_path_map(path), ':p')
+  local target = normalize_path(path, view.session)
   for index, file in ipairs(view.files) do
-    if vim.fn.fnamemodify(file.file, ':p') == target then
+    if normalize_path(file.file, view.session) == target then
       if view.index == index and not view.range_mode then
         local caller_tab = vim.api.nvim_get_current_tabpage()
         M.close()
@@ -874,8 +955,7 @@ function M.toggle_file(path, from, session_id)
       return true
     end
   end
-  vim.notify('File not found in selected turn diff: ' .. path, vim.log.levels.WARN)
-  return true
+  return false
 end
 
 ---@param opts? {focus_input?: boolean}
@@ -898,10 +978,10 @@ end
 function M.open(files, session, options)
   local index = 1
   if options and options.file then
-    local target = vim.fn.fnamemodify(util.apply_reverse_path_map(options.file), ':p')
+    local target = normalize_path(options.file, session)
     local selected
     for file_index, file in ipairs(files) do
-      if vim.fn.fnamemodify(file.file, ':p') == target then
+      if normalize_path(file.file, session) == target then
         selected = file_index
         break
       end
@@ -1010,7 +1090,10 @@ function M.open(files, session, options)
   })
   if #files > 0 then
     vim.api.nvim_win_set_cursor(list_win, { assert(selected_row()), 0 })
-    M.show_sides()
+    update()
+    if view.before_lines then
+      M.show_sides()
+    end
   else
     set_preview(preview_win, { 'No changes in selected turn.' }, '')
   end

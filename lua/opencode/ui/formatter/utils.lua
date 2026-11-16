@@ -241,7 +241,8 @@ end
 ---@param path string
 ---@param first_line integer
 ---@param last_line integer
-function M.add_tool_diff_action(output, message, context, path, first_line, last_line)
+---@param patch? string
+function M.add_tool_diff_action(output, message, context, path, first_line, last_line, patch)
   if not context or not context.interactive or not message then
     return
   end
@@ -249,10 +250,14 @@ function M.add_tool_diff_action(output, message, context, path, first_line, last
   if not connection or connection.protocol ~= 'v2' then
     return
   end
+  local args = { message.id, path, message.session_id }
+  if patch then
+    args[#args + 1] = patch
+  end
   output:add_action({
     text = '[D]iff file',
     type = 'diff_toggle_file',
-    args = { message.id, path, message.session_id },
+    args = args,
     key = 'D',
     display_line = first_line,
     range = { from = first_line, to = last_line },

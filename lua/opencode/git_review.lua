@@ -37,6 +37,76 @@ local function observed_entries()
   return entries
 end
 
+---@param from_id string|nil
+---@param to_id string|nil
+---@return {path: string, patch: string}[]
+local function observed_tool_changes(from_id, to_id)
+  local entries = observed_entries()
+  local start_index
+
+  if from_id then
+    for index, entry in ipairs(entries) do
+      if entry.kind == 'user' and entry.id == from_id then
+        start_index = index
+        break
+      end
+    end
+  end
+
+  if not start_index then
+    for index = #entries, 1, -1 do
+      if entries[index].kind == 'user' then
+        start_index = index
+        break
+      end
+    end
+  end
+
+  if not start_index then
+    return {}
+  end
+
+  local end_index = #entries
+  if to_id then
+    local to_index
+    for index = start_index, #entries do
+      if entries[index].kind == 'user' and entries[index].id == to_id then
+        to_index = index
+        break
+      end
+    end
+    if to_index then
+      for index = to_index + 1, #entries do
+        if entries[index].kind == 'user' then
+          end_index = index - 1
+          break
+        end
+      end
+    end
+  elseif from_id then
+    for index = start_index + 1, #entries do
+      if entries[index].kind == 'user' then
+        end_index = index - 1
+        break
+      end
+    end
+  end
+
+  local changes = {}
+  for index = start_index, end_index do
+    for _, part in ipairs(entries[index].content or {}) do
+      if part.kind == 'tool' and part.changes then
+        for _, change in ipairs(part.changes) do
+          if change.path and change.diff then
+            changes[#changes + 1] = { path = change.path, patch = change.diff }
+          end
+        end
+      end
+    end
+  end
+  return changes
+end
+
 local function is_current(context)
   return context.generation == generation and state.active_session == context.session and vim.fn.getcwd() == context.cwd
 end
@@ -46,7 +116,7 @@ local function v2_connection()
   return connection and connection.protocol == 'v2' and connection or nil
 end
 
-local function review_turn(context, message_id, to, file_path, message_count)
+local function review_turn(context, message_id, to, file_path, message_count, patch)
   if file_path and session_diff.toggle_file(file_path, message_id, context.session.id) then
     return
   end
@@ -57,6 +127,23 @@ local function review_turn(context, message_id, to, file_path, message_count)
     :await()
   if not is_current(context) then
     return
+  end
+  local changes = observed_tool_changes(message_id, to)
+  local latest = {}
+  local order = {}
+  for _, change in ipairs(changes) do
+    if not latest[change.path] then
+      order[#order + 1] = change.path
+    end
+    latest[change.path] = change
+  end
+  for _, path in ipairs(order) do
+    if not session_diff.has_file(files, path, context.session) then
+      files[#files + 1] = session_diff.file_from_patch(path, latest[path].patch)
+    end
+  end
+  if file_path and patch and not session_diff.has_file(files, file_path, context.session) then
+    files[#files + 1] = session_diff.file_from_patch(file_path, patch)
   end
   session_diff.open(files, context.session, {
     from = message_id,
@@ -184,8 +271,8 @@ M.review = review_action(function(context, ref, to, message_count)
   display(context, select_file(context, files, 'Select a file to review:'))
 end)
 
----@type fun(message_id: string, path: string, session_id: string): Promise<nil>
-M.toggle_file = review_action(function(context, message_id, path, session_id)
+---@type fun(message_id: string, path: string, session_id: string, patch?: string): Promise<nil>
+M.toggle_file = review_action(function(context, message_id, path, session_id, patch)
   if context.session.id ~= session_id or not v2_connection() then
     return
   end
@@ -199,7 +286,7 @@ M.toggle_file = review_action(function(context, message_id, path, session_id)
       if not from then
         error('Tool has no preceding user message')
       end
-      return review_turn(context, from, nil, path)
+      return review_turn(context, from, nil, path, nil, patch)
     end
   end
   error('Tool message is no longer in the active session')

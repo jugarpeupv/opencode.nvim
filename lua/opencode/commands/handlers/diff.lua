@@ -43,8 +43,8 @@ M.actions.diff_open = with_output_open(function(from_snapshot_id, _to_snapshot_i
   return git_review.review(extract_hash_arg(from_snapshot_id))
 end, true)
 
-M.actions.diff_toggle_file = with_output_open(function(message_id, file_path, session_id)
-  return git_review.toggle_file(message_id, file_path, session_id)
+M.actions.diff_toggle_file = with_output_open(function(message_id, file_path, session_id, patch)
+  return git_review.toggle_file(message_id, file_path, session_id, patch)
 end, true)
 
 M.actions.diff_next = with_output_open(function()

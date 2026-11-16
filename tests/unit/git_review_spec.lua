@@ -233,4 +233,106 @@ describe('asynchronous git review', function()
     review.toggle_file('msg_tool', '/project/selected.lua', 'one'):wait()
     assert.is_nil(requested)
   end)
+
+  it('collects external tool changes for diff open without a file', function()
+    local opened
+    local observed = {
+      entry_order = { 'msg_user', 'msg_assistant', 'msg_tool' },
+      entries_by_id = {
+        msg_user = { id = 'msg_user', kind = 'user', content = {} },
+        msg_assistant = { id = 'msg_assistant', kind = 'assistant', content = {} },
+        msg_tool = {
+          id = 'msg_tool',
+          kind = 'assistant',
+          content = {
+            {
+              kind = 'tool',
+              name = 'edit',
+              changes = { { path = '/outside/file.lua', diff = '@@ -1 +1 @@\n-old\n+new' } },
+            },
+          },
+        },
+      },
+    }
+    state.jobs.set_server({
+      protocol = 'v2',
+      is_ready = function()
+        return true
+      end,
+      observe = function()
+        return {
+          read = function()
+            return observed
+          end,
+        }
+      end,
+      operations = {
+        diff_session = function()
+          return Promise.new():resolve({})
+        end,
+      },
+    })
+    session_diff.open = function(files, _, options)
+      opened = { files = files, file = options.file }
+    end
+
+    review.review():wait()
+    assert.is_nil(opened.file)
+    assert.equals(1, #opened.files)
+    assert.equals('/outside/file.lua', opened.files[1].file)
+    assert.equals('@@ -1 +1 @@\n-old\n+new', opened.files[1].patch)
+  end)
+
+  it('collects only the selected turn for a tool file', function()
+    local opened
+    local observed = {
+      entry_order = { 'u1', 't1', 'u2', 't2' },
+      entries_by_id = {
+        u1 = { id = 'u1', kind = 'user', content = {} },
+        t1 = {
+          id = 't1',
+          kind = 'assistant',
+          content = {
+            { kind = 'tool', name = 'edit', changes = { { path = '/outside/one.lua', diff = 'one' } } },
+          },
+        },
+        u2 = { id = 'u2', kind = 'user', content = {} },
+        t2 = {
+          id = 't2',
+          kind = 'assistant',
+          content = {
+            { kind = 'tool', name = 'edit', changes = { { path = '/outside/two.lua', diff = 'two' } } },
+          },
+        },
+      },
+    }
+    state.jobs.set_server({
+      protocol = 'v2',
+      is_ready = function()
+        return true
+      end,
+      observe = function()
+        return {
+          read = function()
+            return observed
+          end,
+        }
+      end,
+      operations = {
+        diff_session = function()
+          return Promise.new():resolve({})
+        end,
+      },
+    })
+    session_diff.toggle_file = function()
+      return false
+    end
+    session_diff.open = function(files)
+      opened = files
+    end
+
+    review.toggle_file('t1', '/outside/one.lua', 'one', 'one'):wait()
+    assert.equals(1, #opened)
+    assert.equals('/outside/one.lua', opened[1].file)
+  end)
 end)

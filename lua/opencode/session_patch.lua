@@ -83,4 +83,108 @@ function M.sides(patch)
   return before, after
 end
 
+---@class OpencodePatchHunk
+---@field old_start integer
+---@field old_lines string[]
+---@field new_start integer
+---@field new_lines string[]
+
+---@param patch string
+---@return OpencodePatchHunk[]|nil
+local function parse_hunks(patch)
+  local hunks = {}
+  local lines = vim.split(patch:gsub('\r\n', '\n'), '\n', { plain = true })
+  local index = 1
+  while index <= #lines do
+    local line = lines[index]
+    local old_start, old_size, new_start, new_size = line:match('^@@ %-(%d+),?(%d*) %+(%d+),?(%d*) @@')
+    if old_start then
+      local old_left = old_size == '' and 1 or assert(tonumber(old_size))
+      local new_left = new_size == '' and 1 or assert(tonumber(new_size))
+      local old_lines, new_lines = {}, {}
+      index = index + 1
+      while index <= #lines and (old_left > 0 or new_left > 0) do
+        local body = lines[index]
+        local marker = body:sub(1, 1)
+        if marker == ' ' then
+          local text = body:sub(2)
+          old_lines[#old_lines + 1] = text
+          new_lines[#new_lines + 1] = text
+          old_left, new_left = old_left - 1, new_left - 1
+        elseif marker == '-' then
+          old_lines[#old_lines + 1] = body:sub(2)
+          old_left = old_left - 1
+        elseif marker == '+' then
+          new_lines[#new_lines + 1] = body:sub(2)
+          new_left = new_left - 1
+        elseif marker == '\\' then
+          -- "\ No newline at end of file"
+        elseif body == '' then
+          -- Some producers omit the leading space for empty context lines.
+          old_lines[#old_lines + 1] = ''
+          new_lines[#new_lines + 1] = ''
+          old_left, new_left = old_left - 1, new_left - 1
+        else
+          return nil
+        end
+        if old_left < 0 or new_left < 0 then
+          return nil
+        end
+        index = index + 1
+      end
+      if old_left ~= 0 or new_left ~= 0 then
+        return nil
+      end
+      hunks[#hunks + 1] = {
+        old_start = assert(tonumber(old_start)),
+        old_lines = old_lines,
+        new_start = assert(tonumber(new_start)),
+        new_lines = new_lines,
+      }
+    else
+      index = index + 1
+    end
+  end
+  return #hunks > 0 and hunks or nil
+end
+
+---Reconstruct before/after from a partial patch and the current file contents.
+---@param patch string
+---@param current string[]
+---@return string[]?, string[]?
+function M.sides_from_file(patch, current)
+  local hunks = parse_hunks(patch)
+  if not hunks then
+    return nil, nil
+  end
+
+  local before = vim.deepcopy(current)
+  local after = vim.deepcopy(current)
+  for hunk_index = #hunks, 1, -1 do
+    local hunk = hunks[hunk_index]
+    local new_count = #hunk.new_lines
+    local start = hunk.new_start + (new_count == 0 and 1 or 0)
+
+    for offset = 0, new_count - 1 do
+      if after[start + offset] ~= hunk.new_lines[offset + 1] then
+        return nil, nil
+      end
+    end
+
+    local spliced = {}
+    for line_index = 1, start - 1 do
+      spliced[#spliced + 1] = before[line_index]
+    end
+    for _, line in ipairs(hunk.old_lines) do
+      spliced[#spliced + 1] = line
+    end
+    for line_index = start + new_count, #before do
+      spliced[#spliced + 1] = before[line_index]
+    end
+    before = spliced
+  end
+
+  return before, after
+end
+
 return M

@@ -180,12 +180,15 @@ describe('session diff', function()
   it('clamps gf line navigation to the current working-tree file length', function()
     local path = vim.fn.getcwd() .. '/lua/opencode/session_patch.lua'
     local count = #vim.fn.readfile(path)
-    local text = '@@ -1,100 +1,100 @@\n' .. string.rep(' context\n', 99) .. '-old\n+new'
+    local context_count = count + 9
+    local text = string.format('@@ -1,%d +1,%d @@\n', context_count + 1, context_count + 1)
+      .. string.rep(' context\n', context_count)
+      .. '-old\n+new'
     diff.open({ file(path, text) }, { id = 'ses_gf_clamp' })
     diff.show_patch()
     local preview = vim.api.nvim_tabpage_list_wins(0)[2]
     vim.api.nvim_set_current_win(preview)
-    vim.api.nvim_win_set_cursor(preview, { 102, 0 })
+    vim.api.nvim_win_set_cursor(preview, { context_count + 3, 0 })
     vim.api.nvim_feedkeys('gf', 'xt', false)
     assert.equals(count, vim.api.nvim_win_get_cursor(0)[1])
     vim.cmd('tabclose')
@@ -705,6 +708,7 @@ describe('session diff', function()
     )
     assert.is_true(diff.toggle_file(cwd .. '/nested/b.lua', 'msg_123', 'ses_123'))
     assert.equals(previous, vim.api.nvim_get_current_tabpage())
+    assert.is_false(diff.toggle_file(cwd .. '/missing.lua', 'msg_123', 'ses_123'))
   end)
 
   it('opens on the requested tool file instead of the first changed file', function()
@@ -817,5 +821,102 @@ describe('session diff', function()
     assert.equals(list_width, vim.api.nvim_win_get_width(list_win))
     diff.close()
     assert.equals(original_tab, vim.api.nvim_get_current_tabpage())
+  end)
+
+  it('matches relative diff paths against the session directory', function()
+    local base = vim.fn.getcwd()
+    local session = { id = 'ses_paths', location = { directory = base } }
+    assert.is_true(diff.has_file({ file('lua/a.lua', '') }, base .. '/lua/a.lua', session))
+    assert.is_false(diff.has_file({ file('lua/a.lua', '') }, base .. '/other/lua/a.lua', session))
+  end)
+
+  it('opens an external absolute path in the review panel', function()
+    local cwd = vim.fn.getcwd()
+    local external = '/outside/project/lua/session.lua'
+    diff.open({
+      file(cwd .. '/inside.lua', '@@ -1 +1 @@\n-old\n+new'),
+      file(external, '@@ -1 +1 @@\n-old\n+new'),
+    }, { id = 'ses_external', location = { directory = cwd } }, { from = 'msg_1', file = external })
+
+    local list_win = vim.api.nvim_get_current_win()
+    local row = vim.api.nvim_win_get_cursor(list_win)[1]
+    local line = vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(list_win), row - 1, row, false)[1]
+    assert.is_true(line:find('session.lua', 1, true) ~= nil)
+
+    local found = false
+    for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+      local winbar = vim.wo[win].winbar
+      if winbar and winbar:find(external, 1, true) then
+        found = true
+      end
+    end
+    assert.is_true(found)
+  end)
+
+  it('shows a unified patch when side-by-side is unavailable', function()
+    local cwd = vim.fn.getcwd()
+    local external = '/outside/project/lua/partial.lua'
+    diff.open({
+      file(external, '@@ -10,3 +10,4 @@\n context\n-old\n+new\n+extra'),
+    }, { id = 'ses_partial', location = { directory = cwd } }, { from = 'msg_1', file = external })
+
+    local preview_buf
+    for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+      local winbar = vim.wo[win].winbar
+      if winbar and winbar:find(external, 1, true) then
+        preview_buf = vim.api.nvim_win_get_buf(win)
+      end
+    end
+
+    assert.is_not_nil(preview_buf)
+    assert.is_truthy(vim.bo[preview_buf].filetype:find('diff', 1, true))
+    assert.is_truthy(table.concat(vim.api.nvim_buf_get_lines(preview_buf, 0, -1, false), '\n'):find('@@', 1, true))
+  end)
+
+  it('reconstructs sides from a partial patch and file contents', function()
+    local before, after = patch.sides_from_file('@@ -2 +2 @@\n-TWO\n+two', { 'one', 'two', 'three' })
+    assert.same({ 'one', 'TWO', 'three' }, before)
+    assert.same({ 'one', 'two', 'three' }, after)
+
+    local delete_before, delete_after = patch.sides_from_file('@@ -2 +1,0 @@\n-two', { 'one', 'three' })
+    assert.same({ 'one', 'two', 'three' }, delete_before)
+    assert.same({ 'one', 'three' }, delete_after)
+  end)
+
+  it('builds side-by-side sides from the file for a partial patch', function()
+    local path = vim.fn.tempname() .. '.lua'
+    vim.fn.writefile({ 'one', 'two', 'three' }, path)
+
+    diff.open(
+      { file(path, '@@ -2 +2 @@\n-TWO\n+two') },
+      { id = 'ses_file_sides', location = { directory = vim.fn.getcwd() } },
+      { from = 'msg_1' }
+    )
+
+    local winbars = {}
+    for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+      winbars[#winbars + 1] = vim.wo[win].winbar
+    end
+    assert.is_true(vim.tbl_contains(winbars, 'Before: ' .. path))
+    assert.is_true(vim.tbl_contains(winbars, 'After: ' .. path))
+
+    vim.fn.delete(path)
+  end)
+
+  it('builds a review entry from a tool patch', function()
+    local added = diff.file_from_patch('/outside/a.lua', '--- /dev/null\n+++ b/a.lua\n@@ -0,0 +1,2 @@\n+one\n+two')
+    assert.same({ file = '/outside/a.lua', patch = added.patch, additions = 2, deletions = 0, status = 'added' }, added)
+
+    local deleted = diff.file_from_patch('/outside/b.lua', '--- a/b.lua\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-one\n-two')
+    assert.same(
+      { file = '/outside/b.lua', patch = deleted.patch, additions = 0, deletions = 2, status = 'deleted' },
+      deleted
+    )
+
+    local modified = diff.file_from_patch('/outside/c.lua', '--- a/c.lua\n+++ b/c.lua\n@@ -1 +1 @@\n-old\n+new')
+    assert.same(
+      { file = '/outside/c.lua', patch = modified.patch, additions = 1, deletions = 1, status = 'modified' },
+      modified
+    )
   end)
 end)

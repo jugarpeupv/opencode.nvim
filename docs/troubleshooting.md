@@ -58,6 +58,13 @@ With containers, remote hosts, or WSL, check `path_map` and
 from a session diff land on the current file, so lines may be off if the file
 changed since.
 
+## Diff a file outside the session directory
+
+`D` opens the session review panel. If the agent edited a file outside the
+session's project, the plugin adds the tool call's patch to that panel using the
+file's absolute path, so the panel can show diffs from other working
+directories.
+
 ## Capture and export streamed events
 
 Event capture is off by default. Captured events stay in memory until you

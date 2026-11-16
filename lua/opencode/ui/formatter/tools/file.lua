@@ -85,7 +85,15 @@ function M.format(output, part, context, _, message)
     output:add_fold_with_threshold(start_line, config.ui.output.tools.show_output, config.ui.output.tools.use_folds)
   end
   if tool_type == 'edit' and part.changes and part.changes[1] and target.path then
-    utils.add_tool_diff_action(output, message, context, target.path, header_line, output:get_line_count() - 1)
+    utils.add_tool_diff_action(
+      output,
+      message,
+      context,
+      target.path,
+      header_line,
+      output:get_line_count() - 1,
+      part.changes[1].diff
+    )
   end
 end
 
