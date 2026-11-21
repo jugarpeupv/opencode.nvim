@@ -486,9 +486,11 @@ function M._format_review_comment_context(output, part)
       output:add_line('Lines ' .. comment.lines .. ' (' .. (comment.side or part.source.side or 'after') .. '):')
     end
     output:add_lines(vim.split(comment.comment or '', '\n'))
-    output:add_line('`````' .. lang)
-    output:add_lines(vim.split(comment.code or '', '\n'))
-    output:add_line('`````')
+    local code_lines = vim.split(comment.code or '', '\n')
+    local fence = format_utils.markdown_fence_for(code_lines)
+    output:add_line(fence .. lang)
+    output:add_lines(code_lines)
+    output:add_line(fence)
     output:add_empty_line()
   end
   M.add_vertical_border(output, start_line, output:get_line_count(), 'OpencodeMessageRoleUser', -3)
@@ -814,7 +816,12 @@ local function add_symbol_reference_highlights(output, rendered, rendered_mentio
       local abs_start = line_start + start_pos - 1
       local abs_end = line_start + end_pos - 1
 
-      if token and not in_ranges(rendered_mention_ranges, abs_start, abs_end) and symbol_refs[token] then
+      if
+        token
+        and symbol_refs[token]
+        and symbol_tokens.is_code_like(line, start_pos, end_pos, token)
+        and not in_ranges(rendered_mention_ranges, abs_start, abs_end)
+      then
         output:add_extmark(first_line_idx + line_idx - 1, {
           start_col = start_pos - 1,
           end_col = end_pos,
@@ -868,7 +875,12 @@ local function add_symbol_reference_targets(output, rendered, rendered_mention_r
 
       -- Empty-candidate guard keeps the zero-lookup contract testable here;
       -- targets_for_token re-checks internally for other callers.
-      if token and not in_ranges(rendered_mention_ranges, abs_start, abs_end) and #candidates > 0 then
+      if
+        token
+        and #candidates > 0
+        and symbol_tokens.is_code_like(line, start_pos, end_pos, token)
+        and not in_ranges(rendered_mention_ranges, abs_start, abs_end)
+      then
         local targets = symbol_snapshot.targets_for_token(context.symbol_cycle, token, candidates)
         if #targets > 0 then
           output:add_target({
