@@ -203,6 +203,56 @@ describe('hooks', function()
       assert.equals('test-session', called_session.id)
     end)
 
+    it('ignores v2 session.idle as a completion signal', function()
+      local connection = service_support.mock_connection()
+      connection.protocol = 'v2'
+      state.jobs.set_server(connection)
+      local called = false
+      config.hooks.on_done_thinking = function()
+        called = true
+      end
+      session_runtime.setup_done_thinking_events()
+
+      vim.api.nvim_exec_autocmds('User', {
+        pattern = 'OpencodeEvent:session.idle',
+        data = { event = { type = 'session.idle', properties = { sessionID = 'test-session' } } },
+      })
+      vim.wait(100, function()
+        return false
+      end)
+
+      assert.is_false(called)
+    end)
+
+    it('calls the hook once for a v2 completion', function()
+      local connection = service_support.mock_connection()
+      connection.protocol = 'v2'
+      state.jobs.set_server(connection)
+      local calls = 0
+      config.hooks.on_done_thinking = function()
+        calls = calls + 1
+      end
+      session_runtime.setup_done_thinking_events()
+
+      local function emit(event_type)
+        vim.api.nvim_exec_autocmds('User', {
+          pattern = 'OpencodeEvent:' .. event_type,
+          data = { event = { type = event_type, properties = { sessionID = 'test-session' } } },
+        })
+      end
+      emit('session.execution.succeeded')
+      emit('session.idle')
+
+      vim.wait(1000, function()
+        return calls > 0
+      end)
+      vim.wait(100, function()
+        return false
+      end)
+
+      assert.equals(1, calls)
+    end)
+
     it('should not error when hook is nil', function()
       expect_nil_hook_no_error(function()
         session_runtime.on_session_request_completed('test-session'):wait()

@@ -135,6 +135,11 @@ function M.setup_done_thinking_events(subscribe)
       local event = args.data and args.data.event
       local session_id = event and event.properties and event.properties.sessionID
       if type(session_id) == 'string' then
+        -- V2 emits both execution.* and session.idle for the same completion.
+        -- Idle is a viewer watermark there, not another completion signal.
+        if event.type == 'session.idle' and state.opencode_server and state.opencode_server.protocol == 'v2' then
+          return
+        end
         M.on_session_request_completed(session_id)
       end
     end,
